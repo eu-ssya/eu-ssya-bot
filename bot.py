@@ -303,6 +303,7 @@ async def _before_rss_loop():
 
 @bot.event
 async def setup_hook():
+    await bot.load_extension("wallet_cog")
     rss_loop.start()
 
 
