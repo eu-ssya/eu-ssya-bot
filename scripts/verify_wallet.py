@@ -20,7 +20,7 @@ assert W._parse_date("2026-11-28") == date(2026, 11, 28)
 assert W._parse_date("2026-01-01") == date(2026, 1, 1)
 
 # _parse_date 무효 — ValueError 발생해야
-for bad in ["2026/11/28", "2026-13-32", "20261128", "yesterday", "", "2026-11", "2026-2-3"]:
+for bad in ["2026/11/28", "2026-13-32", "20261128", "yesterday", "", "2026-11", "2026-2-3", "abcd-ef-gh", "20a6-11-28"]:
     try:
         W._parse_date(bad)
         raise AssertionError(f"_parse_date('{bad}') should have raised")
@@ -42,6 +42,8 @@ assert W.validate_amount(1) is None
 assert W.validate_amount(50000) is None
 assert W.validate_amount(0) is not None  # error message
 assert W.validate_amount(-100) is not None
+assert W.validate_amount(True) is not None  # bool은 int 아님
+assert W.validate_amount(False) is not None
 
 # validate_memo
 assert W.validate_memo("") is None

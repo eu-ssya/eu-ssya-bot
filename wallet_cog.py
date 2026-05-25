@@ -55,9 +55,17 @@ def _parse_date(s: str) -> datetime.date:
     """ISO YYYY-MM-DD 엄격 파싱. 유효하지 않으면 ValueError.
 
     `datetime.date.fromisoformat`이 '2026-2-3' 같은 비표준도 허용하므로,
-    엄격하게 'YYYY-MM-DD' 정확히 10자 + 두 자리 month/day인지 확인한다.
+    엄격하게 'YYYY-MM-DD' 정확히 10자 + 두 자리 month/day + 모든 자리 숫자인지 확인한다.
     """
-    if not isinstance(s, str) or len(s) != 10 or s[4] != "-" or s[7] != "-":
+    if (
+        not isinstance(s, str)
+        or len(s) != 10
+        or s[4] != "-"
+        or s[7] != "-"
+        or not s[0:4].isdigit()
+        or not s[5:7].isdigit()
+        or not s[8:10].isdigit()
+    ):
         raise ValueError(f"날짜 형식이 잘못되었습니다: {s!r} (YYYY-MM-DD 형식이어야 합니다)")
     return datetime.date.fromisoformat(s)
 
@@ -73,7 +81,7 @@ def compute_new_balance(old_balance: int, kind: str, amount: int) -> int:
 
 def validate_amount(amount: int) -> Optional[str]:
     """유효하면 None, 아니면 한국어 에러 메시지."""
-    if not isinstance(amount, int) or amount <= 0:
+    if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
         return "금액은 1원 이상의 정수여야 합니다."
     return None
 
