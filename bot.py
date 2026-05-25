@@ -39,18 +39,22 @@ def load_data() -> Dict:
     파일이 없거나 형식이 잘못되었으면 기본 구조로 초기화.
     """
     if not os.path.exists(DATA_FILE):
-        return {"feeds": []}
+        return {"feeds": [], "wallets": {}}
 
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError):
         # 파일이 깨졌거나 비어있을 때
-        return {"feeds": []}
+        return {"feeds": [], "wallets": {}}
 
     # feeds 키가 없거나 list가 아니면 초기화
     if "feeds" not in data or not isinstance(data["feeds"], list):
         data["feeds"] = []
+
+    # wallets 키가 없거나 dict가 아니면 초기화
+    if "wallets" not in data or not isinstance(data["wallets"], dict):
+        data["wallets"] = {}
 
     return data
 
