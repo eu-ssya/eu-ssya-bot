@@ -18,9 +18,10 @@
 - **Language:** Python 3.14+
 - **Discord Library:** discord.py (Slash Commands)
 - **RSS Parser:** feedparser
+- **Env Loader:** python-dotenv
 - **Editor:** VS Code
 - **Storage:** JSON
-- **OS:** window 기준 설명
+- **OS:** Windows 기준 설명
 
 ## 🔧 Installation (Windows)
 
@@ -46,6 +47,13 @@ pip install -r requirements.txt
 ```bash
 DISCORD_BOT_TOKEN=여기에_봇_토큰_입력
 ```
+
+`.env`는 봇 시작 시 `python-dotenv`로 자동 로드됩니다.
+
+## 🪵 Logging
+
+환경 변수 `LOG_LEVEL`로 로그 레벨을 조정할 수 있습니다 (기본값: `INFO`).
+예: `LOG_LEVEL=DEBUG`로 설정하면 RSS 폴링 루프의 상세 로그가 출력됩니다.
 
 ## ▶️ Running the Bot
 ### VS Code에서 실행 (권장)
