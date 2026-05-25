@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import datetime
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import discord
 from discord.ext import commands
@@ -118,7 +118,7 @@ def _require_text_channel(interaction: discord.Interaction) -> Optional[str]:
 
 def _get_existing_guild_wallet(
     wallets: Dict[str, dict], guild_id: str
-) -> Optional[tuple]:
+) -> Optional[Tuple[str, dict]]:
     """이 guild에 이미 등록된 wallet이 있으면 (channel_id_str, wallet_dict) 반환, 없으면 None."""
     for ch_id_str, wallet in wallets.items():
         if str(wallet.get("guild_id", "")) == str(guild_id):
