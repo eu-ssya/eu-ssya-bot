@@ -21,7 +21,7 @@ logger = logging.getLogger("eu_ssya_bot")
 # ---------------- 설정 ----------------
 load_dotenv()
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-DATA_FILE = "rss_data.json"
+DATA_FILE = os.getenv("DATA_FILE", "rss_data.json")
 
 intents = discord.Intents.default()
 # Slash 명령어만 사용하므로 message_content 권한은 불필요.
