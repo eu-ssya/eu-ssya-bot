@@ -394,6 +394,22 @@ class WalletCog(commands.Cog):
     ) -> None:
         await self._record_transaction(interaction, "income", 금액, 메모, 날짜 or None)
 
+    # ---------------- /모임통장 출금 ----------------
+    @mt_group.command(name="출금", description="출금을 기록합니다 (잔액 감소).")
+    @app_commands.describe(
+        금액="출금 금액 (정수, 원, 1 이상, 잔액 이하)",
+        메모="거래 메모 (선택, 최대 200자)",
+        날짜="YYYY-MM-DD 형식 (선택, 기본=오늘 KST)",
+    )
+    async def withdraw(
+        self,
+        interaction: discord.Interaction,
+        금액: int,
+        메모: str = "",
+        날짜: str = "",
+    ) -> None:
+        await self._record_transaction(interaction, "expense", 금액, 메모, 날짜 or None)
+
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(WalletCog(bot))
