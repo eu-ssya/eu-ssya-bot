@@ -1,0 +1,25 @@
+app = "eu-ssya-bot"
+primary_region = "nrt"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  DATA_FILE = "/data/rss_data.json"
+  LOG_LEVEL = "INFO"
+  TZ = "Asia/Seoul"
+
+[[mounts]]
+  source = "bot_data"
+  destination = "/data"
+  initial_size = "1gb"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+[deploy]
+  strategy = "immediate"
+
+[experimental]
+  auto_rollback = true
