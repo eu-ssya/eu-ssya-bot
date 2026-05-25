@@ -1,12 +1,18 @@
 """모임통장(Wallet) Cog — 스터디 커뮤니티 운영비 관리."""
 from __future__ import annotations
 
+import asyncio
 import datetime
 import logging
+import uuid
 from typing import Dict, Optional, Tuple
 
 import discord
+from discord import app_commands
 from discord.ext import commands
+
+# bot.py의 공유 락/저장소
+from bot import _data_lock, load_data, save_data
 
 logger = logging.getLogger("eu_ssya_bot")
 
@@ -126,12 +132,93 @@ def _get_existing_guild_wallet(
     return None
 
 
+def _build_registered_response(initial_balance: int) -> str:
+    """등록 성공 응답 문자열."""
+    return (
+        f"모임통장을 시작합니다. 초기 잔액: {format_krw(initial_balance)}\n"
+        f"채널 이름이 곧 업데이트됩니다."
+    )
+
+
 # ---------------- Cog ----------------
 class WalletCog(commands.Cog):
     """모임통장 명령 + UI + rename worker."""
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+
+    mt_group = app_commands.Group(
+        name="모임통장",
+        description="모임통장 (스터디 커뮤니티 운영비) 관리",
+    )
+
+    # ---------------- /모임통장 등록 ----------------
+    @mt_group.command(name="등록", description="이 채널을 모임통장으로 등록합니다.")
+    async def register(self, interaction: discord.Interaction) -> None:
+        # 권한
+        if not is_admin(interaction):
+            await interaction.response.send_message(
+                "이 명령은 서버 관리자만 사용할 수 있습니다.", ephemeral=True
+            )
+            return
+
+        # 컨텍스트
+        err = _require_text_channel(interaction)
+        if err:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+
+        channel = interaction.channel
+        guild = interaction.guild
+        me = guild.me
+        if me is None or not channel.permissions_for(me).manage_channels:
+            await interaction.response.send_message(
+                "봇에 '채널 관리' 권한이 필요합니다. 서버 설정에서 권한을 부여해주세요.",
+                ephemeral=True,
+            )
+            return
+
+        ch_key = str(channel.id)
+        guild_id_str = str(guild.id)
+
+        async with _data_lock:
+            data = load_data()
+            wallets = data["wallets"]
+
+            # 이 채널 중복 등록
+            if ch_key in wallets:
+                await interaction.response.send_message(
+                    "이 채널은 이미 모임통장으로 등록되어 있습니다.", ephemeral=True
+                )
+                return
+
+            # 같은 서버 다른 채널 등록 충돌
+            existing = _get_existing_guild_wallet(wallets, guild_id_str)
+            if existing is not None:
+                existing_ch_id, _ = existing
+                await interaction.response.send_message(
+                    f"이 서버에는 이미 <#{existing_ch_id}> 에 모임통장이 등록되어 있습니다. "
+                    f"한 서버에는 한 개만 가능합니다.",
+                    ephemeral=True,
+                )
+                return
+
+            # 등록
+            wallets[ch_key] = {
+                "guild_id": guild_id_str,
+                "balance": 0,
+                "original_name": channel.name,
+                "created_at": _now_kst_iso(),
+                "transactions": [],
+            }
+            save_data(data)
+            _pending_balance[channel.id] = 0
+
+        logger.info(
+            "wallet register: channel=%s guild=%s by=%s",
+            channel.id, guild.id, interaction.user.id,
+        )
+        await interaction.response.send_message(_build_registered_response(0))
 
 
 async def setup(bot: commands.Bot) -> None:
