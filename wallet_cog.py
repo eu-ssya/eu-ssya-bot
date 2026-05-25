@@ -425,7 +425,7 @@ class WalletCog(commands.Cog):
             data = load_data()
             wallets = data.get("wallets", {})
             for ch_id, desired_balance in list(_pending_balance.items()):
-                last = _last_rename.get(ch_id, 0.0)
+                last = _last_rename.get(ch_id, float("-inf"))
                 if now - last < RENAME_COOLDOWN_SECONDS:
                     continue
                 wallet = wallets.get(str(ch_id))
