@@ -816,6 +816,80 @@ class EditModal(discord.ui.Modal, title="거래 수정"):
         )
 
 
+class ConfirmDeleteView(discord.ui.View):
+    def __init__(self, channel_id: int, tx_id: str, tx_preview: str):
+        super().__init__(timeout=VIEW_TIMEOUT_SECONDS)
+        self.channel_id = channel_id
+        self.tx_id = tx_id
+        self.tx_preview = tx_preview
+
+    @discord.ui.button(label="예, 삭제합니다", style=discord.ButtonStyle.danger)
+    async def confirm_delete(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        ch_key = str(self.channel_id)
+        channel_message_id: Optional[str] = None
+        new_balance: Optional[int] = None
+        async with _data_lock:
+            data = load_data()
+            wallet = data["wallets"].get(ch_key)
+            if wallet is None:
+                await interaction.response.send_message(
+                    "모임통장이 더 이상 등록되어 있지 않습니다.", ephemeral=True
+                )
+                return
+            target = next(
+                (t for t in wallet["transactions"] if t["id"] == self.tx_id), None
+            )
+            if target is None:
+                await interaction.response.send_message(
+                    "이미 삭제된 거래입니다.", ephemeral=True
+                )
+                return
+
+            channel_message_id = target.get("channel_message_id")
+            wallet["transactions"].remove(target)
+
+            # 전체 잔액 재계산
+            recomputed = 0
+            for t in wallet["transactions"]:
+                if t["kind"] == "income":
+                    recomputed += int(t["amount"])
+                else:
+                    recomputed -= int(t["amount"])
+            wallet["balance"] = recomputed
+            new_balance = recomputed
+            save_data(data)
+            _pending_balance[self.channel_id] = recomputed
+
+        # 락 밖에서 채널 메시지 delete (있으면)
+        if channel_message_id:
+            channel = interaction.client.get_channel(self.channel_id)
+            if channel is not None:
+                try:
+                    msg = await channel.fetch_message(int(channel_message_id))
+                    await msg.delete()
+                except discord.HTTPException as e:
+                    logger.warning(
+                        "wallet delete: channel message delete failed channel=%s msg=%s err=%s",
+                        self.channel_id, channel_message_id, e,
+                    )
+
+        logger.info(
+            "wallet delete: channel=%s tx=%s new_balance=%d user=%s",
+            self.channel_id, self.tx_id, new_balance, interaction.user.id,
+        )
+        await interaction.response.send_message(
+            f"삭제 완료. 현재 잔액: {format_krw(new_balance)}", ephemeral=True
+        )
+
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await interaction.response.send_message("취소되었습니다.", ephemeral=True)
+
+
 class DetailView(discord.ui.View):
     def __init__(self, channel_id: int, date_str: str, tx_id: str):
         super().__init__(timeout=VIEW_TIMEOUT_SECONDS)
@@ -867,7 +941,43 @@ class DetailView(discord.ui.View):
             return
         await interaction.response.send_modal(EditModal(self.channel_id, self.tx_id, tx))
 
-    # [🗑️ 삭제]는 Task 11에서 추가
+    @discord.ui.button(label="🗑️ 삭제", style=discord.ButtonStyle.danger)
+    async def delete_tx(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        async with _data_lock:
+            data = load_data()
+            wallet = data["wallets"].get(str(self.channel_id))
+        if wallet is None:
+            await interaction.response.send_message(
+                "모임통장이 더 이상 등록되어 있지 않습니다.", ephemeral=True
+            )
+            return
+        tx = next((t for t in wallet["transactions"] if t["id"] == self.tx_id), None)
+        if tx is None:
+            await interaction.response.send_message(
+                "이미 삭제된 거래입니다.", ephemeral=True
+            )
+            return
+
+        kind_label = _KIND_LABEL.get(tx.get("kind", ""), "")
+        sign = "+" if tx.get("kind") == "income" else "-"
+        preview = (
+            f"{kind_label} {sign}{int(tx['amount']):,}원 · "
+            f"{tx.get('memo') or '(메모 없음)'} · {tx.get('date', '')}"
+        )
+
+        view = ConfirmDeleteView(self.channel_id, self.tx_id, preview)
+        embed = discord.Embed(
+            title="🗑️ 정말 삭제하시겠어요?",
+            description=(
+                f"{preview}\n\n"
+                "이 거래는 완전히 삭제되며 잔액에서 차감됩니다. "
+                "채널의 자동 메시지도 함께 삭제됩니다."
+            ),
+            color=0xED4245,
+        )
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     async def on_timeout(self) -> None:
         for item in self.children:
