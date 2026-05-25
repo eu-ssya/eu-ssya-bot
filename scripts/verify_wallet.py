@@ -15,12 +15,20 @@ assert W.format_krw(1234567) == "1,234,567원"
 assert W._format_channel_name(285000) == "💰-285,000원"
 assert W._format_channel_name(0) == "💰-0원"
 
-# _parse_date 유효
+# _parse_date 유효 — YYYY-MM-DD
 assert W._parse_date("2026-11-28") == date(2026, 11, 28)
 assert W._parse_date("2026-01-01") == date(2026, 1, 1)
 
+# _parse_date 유효 — YYYYMMDD (8자) 정규화
+assert W._parse_date("20261128") == date(2026, 11, 28)
+assert W._parse_date("20260101") == date(2026, 1, 1)
+
+# _normalize_date_str
+assert W._normalize_date_str("20261128") == "2026-11-28"
+assert W._normalize_date_str("2026-11-28") == "2026-11-28"
+
 # _parse_date 무효 — ValueError 발생해야
-for bad in ["2026/11/28", "2026-13-32", "20261128", "yesterday", "", "2026-11", "2026-2-3", "abcd-ef-gh", "20a6-11-28"]:
+for bad in ["2026/11/28", "2026-13-32", "yesterday", "", "2026-11", "2026-2-3", "abcd-ef-gh", "20a6-11-28", "2026112", "202611288", "abcdefgh", "2026-11-32"]:
     try:
         W._parse_date(bad)
         raise AssertionError(f"_parse_date('{bad}') should have raised")

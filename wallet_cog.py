@@ -58,22 +58,35 @@ def _today_kst_iso() -> str:
 
 
 def _parse_date(s: str) -> datetime.date:
-    """ISO YYYY-MM-DD 엄격 파싱. 유효하지 않으면 ValueError.
+    """YYYYMMDD(8자) 또는 YYYY-MM-DD(10자) 둘 다 허용. 유효하지 않으면 ValueError.
 
+    8자 입력은 자동으로 하이픈을 넣어 정규화한다.
     `datetime.date.fromisoformat`이 '2026-2-3' 같은 비표준도 허용하므로,
-    엄격하게 'YYYY-MM-DD' 정확히 10자 + 두 자리 month/day + 모든 자리 숫자인지 확인한다.
+    엄격하게 자릿수 + 모든 자리 숫자인지 확인한다.
     """
+    if not isinstance(s, str):
+        raise ValueError(f"날짜 형식이 잘못되었습니다: {s!r} (문자열이어야 합니다)")
+    # 8자 YYYYMMDD → YYYY-MM-DD 정규화
+    if len(s) == 8 and s.isdigit():
+        s = f"{s[0:4]}-{s[4:6]}-{s[6:8]}"
     if (
-        not isinstance(s, str)
-        or len(s) != 10
+        len(s) != 10
         or s[4] != "-"
         or s[7] != "-"
         or not s[0:4].isdigit()
         or not s[5:7].isdigit()
         or not s[8:10].isdigit()
     ):
-        raise ValueError(f"날짜 형식이 잘못되었습니다: {s!r} (YYYY-MM-DD 형식이어야 합니다)")
+        raise ValueError(
+            f"날짜 형식이 잘못되었습니다: {s!r} "
+            f"(YYYYMMDD 또는 YYYY-MM-DD 형식이어야 합니다)"
+        )
     return datetime.date.fromisoformat(s)
+
+
+def _normalize_date_str(s: str) -> str:
+    """입력 날짜를 정규화된 'YYYY-MM-DD' 문자열로 반환. 유효하지 않으면 ValueError."""
+    return _parse_date(s).isoformat()
 
 
 def compute_new_balance(old_balance: int, kind: str, amount: int) -> int:
@@ -279,15 +292,16 @@ class WalletCog(commands.Cog):
             await interaction.response.send_message(memo_err, ephemeral=True)
             return
 
-        # 날짜 — 미입력 시 오늘
+        # 날짜 — 미입력 시 오늘. YYYYMMDD 또는 YYYY-MM-DD 입력 모두 허용 (정규화 후 저장).
         if not date_str:
             date_str = _today_kst_iso()
         else:
             try:
-                _parse_date(date_str)
+                date_str = _normalize_date_str(date_str)
             except ValueError:
                 await interaction.response.send_message(
-                    f"날짜는 YYYY-MM-DD 형식으로 입력해주세요. 예: 2026-11-28",
+                    "날짜는 YYYYMMDD 또는 YYYY-MM-DD 형식으로 입력해주세요. "
+                    "예: 20261128 또는 2026-11-28",
                     ephemeral=True,
                 )
                 return
@@ -383,7 +397,7 @@ class WalletCog(commands.Cog):
     @app_commands.describe(
         금액="입금 금액 (정수, 원, 1 이상)",
         메모="거래 메모 (선택, 최대 200자)",
-        날짜="YYYY-MM-DD 형식 (선택, 기본=오늘 KST)",
+        날짜="YYYYMMDD 또는 YYYY-MM-DD 형식 (선택, 기본=오늘 KST)",
     )
     async def deposit(
         self,
@@ -399,7 +413,7 @@ class WalletCog(commands.Cog):
     @app_commands.describe(
         금액="출금 금액 (정수, 원, 1 이상, 잔액 이하)",
         메모="거래 메모 (선택, 최대 200자)",
-        날짜="YYYY-MM-DD 형식 (선택, 기본=오늘 KST)",
+        날짜="YYYYMMDD 또는 YYYY-MM-DD 형식 (선택, 기본=오늘 KST)",
     )
     async def withdraw(
         self,
@@ -773,10 +787,11 @@ class EditModal(discord.ui.Modal, title="거래 수정"):
 
         new_date_str = (self.date_input.value or "").strip()
         try:
-            _parse_date(new_date_str)
+            new_date_str = _normalize_date_str(new_date_str)
         except ValueError:
             await interaction.response.send_message(
-                "날짜는 YYYY-MM-DD 형식으로 입력해주세요. 예: 2026-11-28",
+                "날짜는 YYYYMMDD 또는 YYYY-MM-DD 형식으로 입력해주세요. "
+                "예: 20261128 또는 2026-11-28",
                 ephemeral=True,
             )
             return
