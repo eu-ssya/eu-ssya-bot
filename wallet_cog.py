@@ -679,6 +679,143 @@ class DateSelectView(discord.ui.View):
             item.disabled = True
 
 
+class EditModal(discord.ui.Modal, title="거래 수정"):
+    def __init__(self, channel_id: int, tx_id: str, current_tx: dict):
+        super().__init__(timeout=VIEW_TIMEOUT_SECONDS)
+        self.channel_id = channel_id
+        self.tx_id = tx_id
+
+        self.amount_input = discord.ui.TextInput(
+            label="금액 (원)",
+            default=str(int(current_tx.get("amount", 0))),
+            required=True,
+            max_length=20,
+        )
+        self.memo_input = discord.ui.TextInput(
+            label="메모 (선택, 최대 200자)",
+            default=current_tx.get("memo", "") or "",
+            required=False,
+            max_length=MAX_MEMO_LEN,
+            style=discord.TextStyle.short,
+        )
+        self.date_input = discord.ui.TextInput(
+            label="날짜 (YYYY-MM-DD)",
+            default=current_tx.get("date", _today_kst_iso()),
+            required=True,
+            max_length=10,
+        )
+        self.add_item(self.amount_input)
+        self.add_item(self.memo_input)
+        self.add_item(self.date_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        # 입력 검증
+        try:
+            new_amount = int(self.amount_input.value.strip())
+        except (ValueError, TypeError):
+            await interaction.response.send_message(
+                "금액은 정수여야 합니다.", ephemeral=True
+            )
+            return
+        amt_err = validate_amount(new_amount)
+        if amt_err:
+            await interaction.response.send_message(amt_err, ephemeral=True)
+            return
+
+        new_memo = (self.memo_input.value or "").strip()
+        memo_err = validate_memo(new_memo)
+        if memo_err:
+            await interaction.response.send_message(memo_err, ephemeral=True)
+            return
+
+        new_date_str = (self.date_input.value or "").strip()
+        try:
+            _parse_date(new_date_str)
+        except ValueError:
+            await interaction.response.send_message(
+                "날짜는 YYYY-MM-DD 형식으로 입력해주세요. 예: 2026-11-28",
+                ephemeral=True,
+            )
+            return
+
+        # 거래 mutate + 잔액 재계산
+        ch_key = str(self.channel_id)
+        new_balance: int
+        channel_message_id: Optional[str] = None
+        new_message_text: str = ""
+        async with _data_lock:
+            data = load_data()
+            wallet = data["wallets"].get(ch_key)
+            if wallet is None:
+                await interaction.response.send_message(
+                    "모임통장이 더 이상 등록되어 있지 않습니다.", ephemeral=True
+                )
+                return
+            target = next(
+                (t for t in wallet["transactions"] if t["id"] == self.tx_id), None
+            )
+            if target is None:
+                await interaction.response.send_message(
+                    "이 거래가 더 이상 존재하지 않습니다.", ephemeral=True
+                )
+                return
+
+            # 수정 후 전체 잔액 시뮬레이션
+            prev_tx = dict(target)
+            target["amount"] = new_amount
+            target["memo"] = new_memo
+            target["date"] = new_date_str
+            # 전체 sum으로 잔액 재계산
+            recomputed = 0
+            for t in wallet["transactions"]:
+                if t["kind"] == "income":
+                    recomputed += int(t["amount"])
+                else:
+                    recomputed -= int(t["amount"])
+            if recomputed < 0:
+                # Overdraft 거부 — 원복
+                target["amount"] = prev_tx["amount"]
+                target["memo"] = prev_tx["memo"]
+                target["date"] = prev_tx["date"]
+                await interaction.response.send_message(
+                    f"수정 시 잔액이 음수({format_krw(recomputed)})가 됩니다. 거부됩니다.",
+                    ephemeral=True,
+                )
+                return
+
+            wallet["balance"] = recomputed
+            new_balance = recomputed
+            save_data(data)
+            _pending_balance[self.channel_id] = recomputed
+
+            # 채널 메시지 edit용 새 텍스트 + message_id
+            new_message_text = _format_transaction_message(
+                target["kind"], new_amount, new_memo, new_date_str, new_balance
+            )
+            channel_message_id = target.get("channel_message_id")
+
+        # 락 밖에서 채널 메시지 edit (있으면)
+        if channel_message_id:
+            channel = interaction.client.get_channel(self.channel_id)
+            if channel is not None:
+                try:
+                    msg = await channel.fetch_message(int(channel_message_id))
+                    await msg.edit(content=new_message_text)
+                except discord.HTTPException as e:
+                    logger.warning(
+                        "wallet edit: message edit failed channel=%s msg=%s err=%s",
+                        self.channel_id, channel_message_id, e,
+                    )
+
+        logger.info(
+            "wallet edit: channel=%s tx=%s new_amount=%d new_balance=%d user=%s",
+            self.channel_id, self.tx_id, new_amount, new_balance, interaction.user.id,
+        )
+        await interaction.response.send_message(
+            f"수정 완료. 현재 잔액: {format_krw(new_balance)}", ephemeral=True
+        )
+
+
 class DetailView(discord.ui.View):
     def __init__(self, channel_id: int, date_str: str, tx_id: str):
         super().__init__(timeout=VIEW_TIMEOUT_SECONDS)
@@ -710,7 +847,27 @@ class DetailView(discord.ui.View):
         embed = _build_item_embed(self.date_str, len(txs))
         await interaction.response.edit_message(content=None, embed=embed, view=view)
 
-    # [✏️ 수정], [🗑️ 삭제]는 Task 10/11에서 추가
+    @discord.ui.button(label="✏️ 수정", style=discord.ButtonStyle.primary)
+    async def edit_tx(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        async with _data_lock:
+            data = load_data()
+            wallet = data["wallets"].get(str(self.channel_id))
+        if wallet is None:
+            await interaction.response.send_message(
+                "모임통장이 더 이상 등록되어 있지 않습니다.", ephemeral=True
+            )
+            return
+        tx = next((t for t in wallet["transactions"] if t["id"] == self.tx_id), None)
+        if tx is None:
+            await interaction.response.send_message(
+                "이 거래가 더 이상 존재하지 않습니다.", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(EditModal(self.channel_id, self.tx_id, tx))
+
+    # [🗑️ 삭제]는 Task 11에서 추가
 
     async def on_timeout(self) -> None:
         for item in self.children:
