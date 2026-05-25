@@ -140,6 +140,33 @@ def _build_registered_response(initial_balance: int) -> str:
     )
 
 
+def _format_transaction_message(
+    kind: str, amount: int, memo: str, date_str: str, new_balance: int
+) -> str:
+    """채널에 송신할 거래 한 줄 메시지.
+
+    예: '📥 +50,000원 · 지각벌금 홍길동 · 2026-11-28 · 잔액: 285,000원'
+    메모가 빈 문자열이면 메모 부분 생략.
+    """
+    if kind == "income":
+        emoji = "📥"
+        sign = "+"
+        signed_amount = amount
+    elif kind == "expense":
+        emoji = "📤"
+        sign = "-"
+        signed_amount = -amount
+    else:
+        raise ValueError(f"unknown kind: {kind!r}")
+
+    parts = [f"{emoji} {sign}{abs(signed_amount):,}원"]
+    if memo:
+        parts.append(memo)
+    parts.append(date_str)
+    parts.append(f"잔액: {new_balance:,}원")
+    return " · ".join(parts)
+
+
 # ---------------- Cog ----------------
 class WalletCog(commands.Cog):
     """모임통장 명령 + UI + rename worker."""
@@ -219,6 +246,149 @@ class WalletCog(commands.Cog):
             channel.id, guild.id, interaction.user.id,
         )
         await interaction.response.send_message(_build_registered_response(0))
+
+    # ---------------- 거래 공통 helper ----------------
+    async def _record_transaction(
+        self,
+        interaction: discord.Interaction,
+        kind: str,
+        amount: int,
+        memo: str,
+        date_str: Optional[str],
+    ) -> None:
+        """입금/출금 공통 로직. kind는 'income' 또는 'expense'."""
+        # 권한
+        if not is_admin(interaction):
+            await interaction.response.send_message(
+                "이 명령은 서버 관리자만 사용할 수 있습니다.", ephemeral=True
+            )
+            return
+
+        # 컨텍스트
+        err = _require_text_channel(interaction)
+        if err:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+
+        # 금액 / 메모 검증
+        amt_err = validate_amount(amount)
+        if amt_err:
+            await interaction.response.send_message(amt_err, ephemeral=True)
+            return
+        memo = memo or ""
+        memo_err = validate_memo(memo)
+        if memo_err:
+            await interaction.response.send_message(memo_err, ephemeral=True)
+            return
+
+        # 날짜 — 미입력 시 오늘
+        if not date_str:
+            date_str = _today_kst_iso()
+        else:
+            try:
+                _parse_date(date_str)
+            except ValueError:
+                await interaction.response.send_message(
+                    f"날짜는 YYYY-MM-DD 형식으로 입력해주세요. 예: 2026-11-28",
+                    ephemeral=True,
+                )
+                return
+
+        channel = interaction.channel
+        ch_key = str(channel.id)
+
+        # 트랜잭션 저장 + 잔액 갱신 (락 안)
+        new_balance: int
+        tx_id: str
+        async with _data_lock:
+            data = load_data()
+            wallet = data["wallets"].get(ch_key)
+            if wallet is None:
+                await interaction.response.send_message(
+                    "이 채널은 모임통장으로 등록되어 있지 않습니다. "
+                    "/모임통장 등록 을 먼저 실행하세요.",
+                    ephemeral=True,
+                )
+                return
+
+            old_balance = int(wallet["balance"])
+            new_balance = compute_new_balance(old_balance, kind, amount)
+
+            # Overdraft 거부 (출금)
+            if kind == "expense" and new_balance < 0:
+                await interaction.response.send_message(
+                    f"잔액({format_krw(old_balance)})보다 큰 출금은 등록할 수 없습니다.",
+                    ephemeral=True,
+                )
+                return
+
+            tx_id = str(uuid.uuid4())
+            tx = {
+                "id": tx_id,
+                "kind": kind,
+                "amount": int(amount),
+                "memo": memo,
+                "date": date_str,
+                "ts": _now_kst_iso(),
+                "user_id": str(interaction.user.id),
+                "channel_message_id": None,  # send 후 갱신
+            }
+            wallet["transactions"].append(tx)
+            wallet["balance"] = new_balance
+            save_data(data)
+            _pending_balance[channel.id] = new_balance
+
+        # 채널 자동 메시지 — 락 밖에서 송신
+        message_id: Optional[int] = None
+        try:
+            msg = await channel.send(
+                _format_transaction_message(kind, amount, memo, date_str, new_balance)
+            )
+            message_id = msg.id
+        except discord.HTTPException as e:
+            logger.warning(
+                "wallet auto-message send failed: channel=%s err=%s",
+                channel.id, e,
+            )
+
+        # 메시지 ID 사후 저장 (락 다시)
+        if message_id is not None:
+            async with _data_lock:
+                data = load_data()
+                wallet = data["wallets"].get(ch_key)
+                if wallet is not None:
+                    for t in wallet["transactions"]:
+                        if t["id"] == tx_id:
+                            t["channel_message_id"] = str(message_id)
+                            break
+                    save_data(data)
+
+        verb = "입금" if kind == "income" else "출금"
+        sign = "+" if kind == "income" else "-"
+        logger.info(
+            "wallet %s: channel=%s amount=%d new_balance=%d user=%s",
+            kind, channel.id, amount, new_balance, interaction.user.id,
+        )
+        await interaction.response.send_message(
+            f"{verb} {sign}{amount:,}원 기록 완료. 현재 잔액: {format_krw(new_balance)}",
+            ephemeral=True,
+        )
+
+    # ---------------- /모임통장 입금 ----------------
+    @mt_group.command(name="입금", description="입금을 기록합니다 (잔액 증가).")
+    @app_commands.describe(
+        금액="입금 금액 (정수, 원, 1 이상)",
+        메모="거래 메모 (선택, 최대 200자)",
+        날짜="YYYY-MM-DD 형식 (선택, 기본=오늘 KST)",
+    )
+    async def deposit(
+        self,
+        interaction: discord.Interaction,
+        금액: int,
+        메모: str = "",
+        날짜: str = "",
+    ) -> None:
+        await self._record_transaction(interaction, "income", 금액, 메모, 날짜 or None)
 
 
 async def setup(bot: commands.Bot) -> None:

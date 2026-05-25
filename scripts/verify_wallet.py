@@ -75,3 +75,15 @@ miss = W._get_existing_guild_wallet(sample_wallets, "G999")
 assert miss is None
 
 print("guard helpers OK")
+
+# ---- _format_transaction_message ----
+msg = W._format_transaction_message("income", 50000, "지각벌금 홍길동", "2026-11-28", 285000)
+assert msg == "📥 +50,000원 · 지각벌금 홍길동 · 2026-11-28 · 잔액: 285,000원", msg
+
+msg2 = W._format_transaction_message("expense", 15000, "", "2026-11-26", 270000)
+assert msg2 == "📤 -15,000원 · 2026-11-26 · 잔액: 270,000원", msg2  # 메모 생략
+
+msg3 = W._format_transaction_message("income", 100, "테스트", "2026-01-01", 100)
+assert msg3 == "📥 +100원 · 테스트 · 2026-01-01 · 잔액: 100원", msg3
+
+print("format_transaction_message OK")
