@@ -497,3 +497,4 @@ pyrightconfig.json
 # Custom ignores
 .discord-token
 **/rss_data.json
+.superpowers/
