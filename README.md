@@ -18,9 +18,10 @@
 - **Language:** Python 3.14+
 - **Discord Library:** discord.py (Slash Commands)
 - **RSS Parser:** feedparser
+- **Env Loader:** python-dotenv
 - **Editor:** VS Code
 - **Storage:** JSON
-- **OS:** window 기준 설명
+- **OS:** Windows 기준 설명
 
 ## 🔧 Installation (Windows)
 
@@ -47,6 +48,13 @@ pip install -r requirements.txt
 DISCORD_BOT_TOKEN=여기에_봇_토큰_입력
 ```
 
+`.env`는 봇 시작 시 `python-dotenv`로 자동 로드됩니다.
+
+## 🪵 Logging
+
+환경 변수 `LOG_LEVEL`로 로그 레벨을 조정할 수 있습니다 (기본값: `INFO`).
+예: `LOG_LEVEL=DEBUG`로 설정하면 RSS 폴링 루프의 상세 로그가 출력됩니다.
+
 ## ▶️ Running the Bot
 ### VS Code에서 실행 (권장)
 1. VS Code 열기
@@ -66,6 +74,22 @@ python bot.py
 | `/rss add <RSS_URL>`    | 현재 채널에 RSS 등록     |
 | `/rss list`             | 등록된 RSS 목록 조회     |
 | `/rss remove <RSS_URL>` | 현재 채널에서 해당 RSS 삭제 |
+
+### 모임통장 (스터디 커뮤니티 운영비)
+
+| Command | 설명 |
+| ------- | ---- |
+| `/모임통장 등록` | 이 채널을 모임통장으로 등록 (한 서버 1개만, 초기 잔액 0원) |
+| `/모임통장 입금 금액:<int> [메모] [날짜]` | 입금 기록 (잔액 증가) |
+| `/모임통장 출금 금액:<int> [메모] [날짜]` | 출금 기록 (잔액 감소, 잔액 초과 거부) |
+| `/모임통장 관리` | 임베드 UI로 거래 수정/삭제 (날짜→항목→버튼) |
+
+모든 명령은 **서버 관리자(Discord Administrator) 권한**만 실행할 수 있습니다.
+모든 멤버는 채널의 자동 메시지로 거래 내역을 조회할 수 있습니다.
+잔액은 채널 이름에 자동 반영됩니다 (예: `💰-285,000원`).
+봇에 **Manage Channels** 권한이 필요합니다 (채널명 변경용).
+
+날짜 형식: `YYYY-MM-DD` (미입력 시 오늘 KST). 미래 날짜도 허용됩니다.
 
 ## 🔄 How It Works
 
