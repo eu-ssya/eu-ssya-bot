@@ -99,9 +99,22 @@ async def fetch_feed(url: str):
 @bot.event
 async def on_ready():
     if not hasattr(bot, "synced"):
-        synced = await bot.tree.sync()
+        test_guild_id = os.getenv("TEST_GUILD_ID")
+        if test_guild_id:
+            guild = discord.Object(id=int(test_guild_id))
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            logger.info(
+                "Synced %d slash command(s) to test guild %s (instant)",
+                len(synced), test_guild_id,
+            )
+        else:
+            synced = await bot.tree.sync()
+            logger.info(
+                "Synced %d slash command(s) globally (may take up to 1 hour)",
+                len(synced),
+            )
         bot.synced = True
-        logger.info("Synced %d slash command(s)", len(synced))
     logger.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
     logger.info("------")
 
