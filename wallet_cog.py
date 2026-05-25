@@ -95,6 +95,37 @@ def validate_memo(memo: str) -> Optional[str]:
     return None
 
 
+# ---------------- Discord 의존 가드 함수 ----------------
+def is_admin(interaction: discord.Interaction) -> bool:
+    """interaction을 호출한 사용자가 Discord Administrator 권한이 있는지."""
+    if interaction.guild is None or interaction.user is None:
+        return False
+    # GuildMember인 경우 guild_permissions 사용 가능
+    perms = getattr(interaction.user, "guild_permissions", None)
+    if perms is None:
+        return False
+    return perms.administrator
+
+
+def _require_text_channel(interaction: discord.Interaction) -> Optional[str]:
+    """텍스트 채널 + guild 가드. 통과하면 None, 실패하면 한국어 에러 메시지."""
+    if interaction.guild is None:
+        return "이 명령은 서버 채널에서만 사용할 수 있습니다."
+    if not isinstance(interaction.channel, discord.TextChannel):
+        return "일반 텍스트 채널에서만 사용할 수 있습니다."
+    return None
+
+
+def _get_existing_guild_wallet(
+    wallets: Dict[str, dict], guild_id: str
+) -> Optional[tuple]:
+    """이 guild에 이미 등록된 wallet이 있으면 (channel_id_str, wallet_dict) 반환, 없으면 None."""
+    for ch_id_str, wallet in wallets.items():
+        if str(wallet.get("guild_id", "")) == str(guild_id):
+            return (ch_id_str, wallet)
+    return None
+
+
 # ---------------- Cog ----------------
 class WalletCog(commands.Cog):
     """모임통장 명령 + UI + rename worker."""

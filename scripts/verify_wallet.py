@@ -57,3 +57,21 @@ assert isinstance(W._pending_balance, dict)
 assert isinstance(W._last_rename, dict)
 
 print("verify_wallet: all assertions PASS")
+
+# ---- 가드 함수 존재 확인 ----
+import inspect
+assert callable(W.is_admin), "is_admin not defined"
+assert callable(W._require_text_channel), "_require_text_channel not defined"
+assert callable(W._get_existing_guild_wallet), "_get_existing_guild_wallet not defined"
+
+# _get_existing_guild_wallet 순수 로직
+sample_wallets = {
+    "100": {"guild_id": "G1", "balance": 50},
+    "200": {"guild_id": "G2", "balance": 80},
+}
+hit = W._get_existing_guild_wallet(sample_wallets, "G1")
+assert hit is not None and hit[0] == "100"
+miss = W._get_existing_guild_wallet(sample_wallets, "G999")
+assert miss is None
+
+print("guard helpers OK")
