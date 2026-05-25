@@ -9,7 +9,7 @@ from typing import Dict, Optional, Tuple
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 # bot.py의 공유 락/저장소
 from bot import _data_lock, load_data, save_data
@@ -409,6 +409,87 @@ class WalletCog(commands.Cog):
         날짜: str = "",
     ) -> None:
         await self._record_transaction(interaction, "expense", 금액, 메모, 날짜 or None)
+
+    # ---------------- 채널명 rename 워커 ----------------
+    @tasks.loop(seconds=RENAME_WORKER_INTERVAL_SECONDS)
+    async def rename_worker_loop(self) -> None:
+        if not _pending_balance:
+            return
+
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+
+        # 락 안에서 메타데이터 스냅샷만 — 네트워크 호출 없음
+        to_process: list = []
+        async with _data_lock:
+            data = load_data()
+            wallets = data.get("wallets", {})
+            for ch_id, desired_balance in list(_pending_balance.items()):
+                last = _last_rename.get(ch_id, 0.0)
+                if now - last < RENAME_COOLDOWN_SECONDS:
+                    continue
+                wallet = wallets.get(str(ch_id))
+                if wallet is None:
+                    # 등록 해제됨 — 큐 정리
+                    _pending_balance.pop(ch_id, None)
+                    continue
+                to_process.append((ch_id, int(desired_balance)))
+
+        # 락 밖에서 실제 channel.edit (개별 try/except)
+        for ch_id, desired_balance in to_process:
+            channel = self.bot.get_channel(ch_id)
+            if channel is None:
+                logger.info("rename worker: channel %s not found", ch_id)
+                _pending_balance.pop(ch_id, None)
+                continue
+
+            new_name = _format_channel_name(desired_balance)
+            try:
+                await channel.edit(name=new_name, reason="모임통장 잔액 업데이트")
+            except discord.HTTPException as e:
+                status = getattr(e, "status", None)
+                retry_after = getattr(e, "retry_after", None)
+                if status == 429:
+                    logger.warning(
+                        "rename rate-limited: channel=%s retry_after=%s",
+                        ch_id, retry_after,
+                    )
+                    bump = max(RENAME_COOLDOWN_SECONDS, float(retry_after or 0))
+                    _last_rename[ch_id] = (
+                        asyncio.get_running_loop().time() + bump - RENAME_COOLDOWN_SECONDS
+                    )
+                    continue
+                logger.warning(
+                    "rename failed: channel=%s status=%s err=%s",
+                    ch_id, status, e,
+                )
+                _pending_balance.pop(ch_id, None)
+                continue
+            except Exception as e:  # noqa: BLE001
+                logger.warning("rename unexpected error: channel=%s err=%s", ch_id, e)
+                _pending_balance.pop(ch_id, None)
+                continue
+
+            # 성공
+            _last_rename[ch_id] = asyncio.get_running_loop().time()
+            # 같은 desired_balance인 경우만 pop — 새 값이 들어왔으면 유지
+            if _pending_balance.get(ch_id) == desired_balance:
+                _pending_balance.pop(ch_id, None)
+            logger.info(
+                "rename committed: channel=%s new_name=%s",
+                ch_id, new_name,
+            )
+
+    @rename_worker_loop.before_loop
+    async def _before_rename_worker_loop(self) -> None:
+        await self.bot.wait_until_ready()
+        logger.info("wallet rename worker loop ready")
+
+    async def cog_load(self) -> None:
+        self.rename_worker_loop.start()
+
+    async def cog_unload(self) -> None:
+        self.rename_worker_loop.cancel()
 
 
 async def setup(bot: commands.Bot) -> None:

@@ -87,3 +87,25 @@ msg3 = W._format_transaction_message("income", 100, "테스트", "2026-01-01", 1
 assert msg3 == "📥 +100원 · 테스트 · 2026-01-01 · 잔액: 100원", msg3
 
 print("format_transaction_message OK")
+
+# ---- cooldown 계산 검증 ----
+# 429 시 _last_rename 값: now + bump - COOLDOWN
+# 다음 체크: cur_now - _last_rename < COOLDOWN ? skip : proceed
+
+COOLDOWN = W.RENAME_COOLDOWN_SECONDS
+t0 = 1000.0
+# retry_after=600 인 경우 bump = max(COOLDOWN, 600) = 600
+bump = max(COOLDOWN, 600.0)
+last_rename = t0 + bump - COOLDOWN  # = 1000 + 600 - 300 = 1300
+# 다음 워커 틱 t=1060: 1060 - 1300 = -240 < 300 → skip ✓
+# 다음 워커 틱 t=1600: 1600 - 1300 = 300 ≥ 300 → proceed ✓
+assert (1060 - last_rename) < COOLDOWN  # skip
+assert (1600 - last_rename) >= COOLDOWN  # proceed
+
+# retry_after 없는 일반 성공: _last_rename = now, 다음 시도는 now+COOLDOWN 후
+t0 = 2000.0
+last_rename_ok = t0
+assert (t0 + COOLDOWN - 1 - last_rename_ok) < COOLDOWN
+assert (t0 + COOLDOWN - last_rename_ok) >= COOLDOWN
+
+print("cooldown math OK")
