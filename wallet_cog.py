@@ -151,15 +151,13 @@ def _format_transaction_message(
     if kind == "income":
         emoji = "📥"
         sign = "+"
-        signed_amount = amount
     elif kind == "expense":
         emoji = "📤"
         sign = "-"
-        signed_amount = -amount
     else:
         raise ValueError(f"unknown kind: {kind!r}")
 
-    parts = [f"{emoji} {sign}{abs(signed_amount):,}원"]
+    parts = [f"{emoji} {sign}{amount:,}원"]
     if memo:
         parts.append(memo)
     parts.append(date_str)
@@ -362,6 +360,12 @@ class WalletCog(commands.Cog):
                             t["channel_message_id"] = str(message_id)
                             break
                     save_data(data)
+                else:
+                    logger.warning(
+                        "wallet deleted between tx record and message_id update: "
+                        "channel=%s tx_id=%s message_id=%s",
+                        ch_key, tx_id, message_id,
+                    )
 
         verb = "입금" if kind == "income" else "출금"
         sign = "+" if kind == "income" else "-"
