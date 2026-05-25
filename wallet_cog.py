@@ -410,6 +410,49 @@ class WalletCog(commands.Cog):
     ) -> None:
         await self._record_transaction(interaction, "expense", 금액, 메모, 날짜 or None)
 
+    # ---------------- /모임통장 관리 ----------------
+    @mt_group.command(name="관리", description="모임통장 거래를 수정/삭제합니다.")
+    async def manage(self, interaction: discord.Interaction) -> None:
+        # 권한
+        if not is_admin(interaction):
+            await interaction.response.send_message(
+                "이 명령은 서버 관리자만 사용할 수 있습니다.", ephemeral=True
+            )
+            return
+
+        # 컨텍스트
+        err = _require_text_channel(interaction)
+        if err:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+
+        channel_id = interaction.channel.id
+        async with _data_lock:
+            data = load_data()
+            wallet = data["wallets"].get(str(channel_id))
+
+        if wallet is None:
+            await interaction.response.send_message(
+                "이 채널은 모임통장으로 등록되어 있지 않습니다. "
+                "/모임통장 등록 을 먼저 실행하세요.",
+                ephemeral=True,
+            )
+            return
+        if not wallet["transactions"]:
+            await interaction.response.send_message(
+                "등록된 거래가 없습니다.", ephemeral=True
+            )
+            return
+
+        # 날짜별 거래 수 집계
+        from collections import Counter
+        date_counts = Counter(t["date"] for t in wallet["transactions"])
+        dates_sorted = sorted(date_counts.items(), key=lambda kv: kv[0], reverse=True)
+
+        view = DateSelectView(channel_id, dates_sorted)
+        embed = _build_date_embed(dates_sorted)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
     # ---------------- 채널명 rename 워커 ----------------
     @tasks.loop(seconds=RENAME_WORKER_INTERVAL_SECONDS)
     async def rename_worker_loop(self) -> None:
