@@ -492,5 +492,230 @@ class WalletCog(commands.Cog):
         self.rename_worker_loop.cancel()
 
 
+# ---------------- 관리 UI Views ----------------
+_KIND_LABEL = {"income": "📥 입금", "expense": "📤 출금"}
+
+
+def _build_detail_embed(tx: dict, current_balance: int) -> discord.Embed:
+    """단일 거래 디테일 임베드."""
+    kind = tx.get("kind", "")
+    label = _KIND_LABEL.get(kind, kind)
+    sign = "+" if kind == "income" else "-"
+    amount = int(tx.get("amount", 0))
+    color = 0x57F287 if kind == "income" else 0xED4245
+
+    embed = discord.Embed(
+        title=f"{label} {sign}{amount:,}원",
+        color=color,
+    )
+    embed.add_field(name="메모", value=tx.get("memo") or "(없음)", inline=False)
+    embed.add_field(name="날짜", value=tx.get("date", "-"), inline=True)
+    user_id = tx.get("user_id", "")
+    embed.add_field(
+        name="등록자",
+        value=f"<@{user_id}>" if user_id else "-",
+        inline=True,
+    )
+    embed.add_field(name="현재 잔액", value=format_krw(current_balance), inline=True)
+    embed.set_footer(text=f"ID: {tx.get('id', '')[:8]}…")
+    return embed
+
+
+def _build_date_embed(dates: list) -> discord.Embed:
+    """날짜 선택 임베드."""
+    embed = discord.Embed(
+        title="📅 어떤 날짜의 거래를 보시겠어요?",
+        description="최근 거래가 있는 날짜를 선택해주세요.",
+        color=0x5865F2,
+    )
+    return embed
+
+
+def _build_item_embed(date_str: str, tx_count: int) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"📅 {date_str} 거래 {tx_count}건",
+        description="수정/삭제할 항목을 선택해주세요.",
+        color=0x5865F2,
+    )
+    return embed
+
+
+class DateSelect(discord.ui.Select):
+    def __init__(self, channel_id: int, dates_with_counts: list):
+        options = []
+        for date_str, count in dates_with_counts[:25]:
+            options.append(
+                discord.SelectOption(
+                    label=f"{date_str} ({count}건)",
+                    value=date_str,
+                )
+            )
+        super().__init__(
+            placeholder="날짜 선택",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.channel_id = channel_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        date_str = self.values[0]
+        # 해당 날짜 거래 로드
+        async with _data_lock:
+            data = load_data()
+            wallet = data["wallets"].get(str(self.channel_id))
+        if wallet is None:
+            await interaction.response.edit_message(
+                content="모임통장이 더 이상 등록되어 있지 않습니다.",
+                embed=None, view=None,
+            )
+            return
+        txs = [t for t in wallet["transactions"] if t.get("date") == date_str]
+        if not txs:
+            await interaction.response.edit_message(
+                content="이 날의 거래가 없습니다 (다른 곳에서 삭제되었을 수 있습니다).",
+                embed=None, view=None,
+            )
+            return
+
+        view = ItemSelectView(self.channel_id, date_str, txs)
+        embed = _build_item_embed(date_str, len(txs))
+        await interaction.response.edit_message(content=None, embed=embed, view=view)
+
+
+class ItemSelect(discord.ui.Select):
+    def __init__(self, channel_id: int, date_str: str, txs: list):
+        options = []
+        for t in txs[:25]:
+            kind = t.get("kind", "")
+            sign = "+" if kind == "income" else "-"
+            label = _KIND_LABEL.get(kind, kind)
+            memo = t.get("memo") or ""
+            preview = memo if len(memo) <= 40 else memo[:37] + "..."
+            display = f"{label} {sign}{int(t['amount']):,}원"
+            if preview:
+                display += f" · {preview}"
+            options.append(
+                discord.SelectOption(
+                    label=display[:100],  # Select label은 100자 제한
+                    value=t["id"],
+                )
+            )
+        super().__init__(
+            placeholder="항목 선택",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.channel_id = channel_id
+        self.date_str = date_str
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        tx_id = self.values[0]
+        async with _data_lock:
+            data = load_data()
+            wallet = data["wallets"].get(str(self.channel_id))
+        if wallet is None:
+            await interaction.response.edit_message(
+                content="모임통장이 더 이상 등록되어 있지 않습니다.",
+                embed=None, view=None,
+            )
+            return
+        tx = next((t for t in wallet["transactions"] if t["id"] == tx_id), None)
+        if tx is None:
+            await interaction.response.edit_message(
+                content="이 거래가 더 이상 존재하지 않습니다.",
+                embed=None, view=None,
+            )
+            return
+
+        view = DetailView(self.channel_id, self.date_str, tx_id)
+        embed = _build_detail_embed(tx, int(wallet["balance"]))
+        await interaction.response.edit_message(content=None, embed=embed, view=view)
+
+
+class ItemSelectView(discord.ui.View):
+    def __init__(self, channel_id: int, date_str: str, txs: list):
+        super().__init__(timeout=VIEW_TIMEOUT_SECONDS)
+        self.channel_id = channel_id
+        self.add_item(ItemSelect(channel_id, date_str, txs))
+
+    @discord.ui.button(label="↩️ 다른 날짜", style=discord.ButtonStyle.secondary)
+    async def back_to_dates(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        async with _data_lock:
+            data = load_data()
+            wallet = data["wallets"].get(str(self.channel_id))
+        if wallet is None or not wallet["transactions"]:
+            await interaction.response.edit_message(
+                content="등록된 거래가 없습니다.",
+                embed=None, view=None,
+            )
+            return
+
+        # 날짜별 거래 수 집계 (최근순)
+        from collections import Counter
+        date_counts = Counter(t["date"] for t in wallet["transactions"])
+        dates_sorted = sorted(date_counts.items(), key=lambda kv: kv[0], reverse=True)
+
+        view = DateSelectView(self.channel_id, dates_sorted)
+        embed = _build_date_embed(dates_sorted)
+        await interaction.response.edit_message(content=None, embed=embed, view=view)
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+
+
+class DateSelectView(discord.ui.View):
+    def __init__(self, channel_id: int, dates_with_counts: list):
+        super().__init__(timeout=VIEW_TIMEOUT_SECONDS)
+        self.channel_id = channel_id
+        self.add_item(DateSelect(channel_id, dates_with_counts))
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+
+
+class DetailView(discord.ui.View):
+    def __init__(self, channel_id: int, date_str: str, tx_id: str):
+        super().__init__(timeout=VIEW_TIMEOUT_SECONDS)
+        self.channel_id = channel_id
+        self.date_str = date_str
+        self.tx_id = tx_id
+
+    @discord.ui.button(label="↩️ 뒤로", style=discord.ButtonStyle.secondary)
+    async def back_to_items(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        async with _data_lock:
+            data = load_data()
+            wallet = data["wallets"].get(str(self.channel_id))
+        if wallet is None:
+            await interaction.response.edit_message(
+                content="모임통장이 더 이상 등록되어 있지 않습니다.",
+                embed=None, view=None,
+            )
+            return
+        txs = [t for t in wallet["transactions"] if t.get("date") == self.date_str]
+        if not txs:
+            await interaction.response.edit_message(
+                content="이 날의 거래가 모두 삭제되었습니다.",
+                embed=None, view=None,
+            )
+            return
+        view = ItemSelectView(self.channel_id, self.date_str, txs)
+        embed = _build_item_embed(self.date_str, len(txs))
+        await interaction.response.edit_message(content=None, embed=embed, view=view)
+
+    # [✏️ 수정], [🗑️ 삭제]는 Task 10/11에서 추가
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+
+
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(WalletCog(bot))
