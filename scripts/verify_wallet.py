@@ -11,9 +11,9 @@ assert W.format_krw(-15000) == "-15,000원", W.format_krw(-15000)
 assert W.format_krw(0) == "0원"
 assert W.format_krw(1234567) == "1,234,567원"
 
-# _format_channel_name
-assert W._format_channel_name(285000) == "💰-285,000원"
-assert W._format_channel_name(0) == "💰-0원"
+# _format_channel_name (콤마 없이, 박스 구분자)
+assert W._format_channel_name(285000) == "💰┃285000원"
+assert W._format_channel_name(0) == "💰┃0원"
 
 # _parse_date 유효 — YYYY-MM-DD
 assert W._parse_date("2026-11-28") == date(2026, 11, 28)

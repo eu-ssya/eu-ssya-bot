@@ -27,7 +27,7 @@ RENAME_COOLDOWN_SECONDS = 300
 # rename 워커 주기.
 RENAME_WORKER_INTERVAL_SECONDS = 60
 # 기본 채널명 포맷 — `{잔액}` 위치 자동 치환.
-DEFAULT_WALLET_NAME_PREFIX = "💰-"
+DEFAULT_WALLET_NAME_PREFIX = "💰┃"
 # 메모 최대 길이.
 MAX_MEMO_LEN = 200
 # View timeout (초).
@@ -43,8 +43,11 @@ def format_krw(amount: int) -> str:
 
 
 def _format_channel_name(balance: int) -> str:
-    """잔액을 채널명 포맷 '💰-285,000원' 형태로 변환."""
-    return f"{DEFAULT_WALLET_NAME_PREFIX}{balance:,}원"
+    """잔액을 채널명 포맷 '💰┃210557원' 형태로 변환.
+
+    Discord 채널명이 콤마를 자동 제거하므로 천단위 구분자 없이 표기.
+    """
+    return f"{DEFAULT_WALLET_NAME_PREFIX}{balance}원"
 
 
 def _now_kst_iso() -> str:
@@ -325,14 +328,6 @@ class WalletCog(commands.Cog):
 
             old_balance = int(wallet["balance"])
             new_balance = compute_new_balance(old_balance, kind, amount)
-
-            # Overdraft 거부 (출금)
-            if kind == "expense" and new_balance < 0:
-                await interaction.response.send_message(
-                    f"잔액({format_krw(old_balance)})보다 큰 출금은 등록할 수 없습니다.",
-                    ephemeral=True,
-                )
-                return
 
             tx_id = str(uuid.uuid4())
             tx = {
@@ -830,17 +825,6 @@ class EditModal(discord.ui.Modal, title="거래 수정"):
                     recomputed += int(t["amount"])
                 else:
                     recomputed -= int(t["amount"])
-            if recomputed < 0:
-                # Overdraft 거부 — 원복
-                target["amount"] = prev_tx["amount"]
-                target["memo"] = prev_tx["memo"]
-                target["date"] = prev_tx["date"]
-                await interaction.response.send_message(
-                    f"수정 시 잔액이 음수({format_krw(recomputed)})가 됩니다. 거부됩니다.",
-                    ephemeral=True,
-                )
-                return
-
             wallet["balance"] = recomputed
             new_balance = recomputed
             save_data(data)
