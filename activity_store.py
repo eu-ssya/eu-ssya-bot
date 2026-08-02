@@ -154,6 +154,32 @@ class ActivityStore:
             )
             return [tuple(row) for row in rows]
 
+    def invalidate_sod_eod_channel(
+        self, guild_id: int, *, effective_at_epoch: int
+    ) -> ActivityConfig:
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                old = self._get_config_in_tx(conn, guild_id)
+                if old.sod_eod_channel_id is None:
+                    conn.commit()
+                    return old
+                new = dataclasses.replace(old, sod_eod_channel_id=None)
+                self._transition_sod_period_in_tx(
+                    conn,
+                    guild_id,
+                    old.sod_eod_channel_id,
+                    None,
+                    effective_at_epoch,
+                    close_reason="config_invalid",
+                )
+                self._upsert_config_in_tx(conn, new, effective_at_epoch)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return new
+
     @staticmethod
     def _replace_unset(
         old: ActivityConfig,
@@ -235,15 +261,16 @@ class ActivityStore:
         old_channel_id: int | None,
         new_channel_id: int | None,
         effective_at_epoch: int,
+        close_reason: str = "channel_changed",
     ) -> None:
         if old_channel_id is not None:
             conn.execute(
                 """
                 UPDATE sod_eod_channel_periods
-                SET ended_epoch=?, ended_reason='channel_changed'
+                SET ended_epoch=?, ended_reason=?
                 WHERE guild_id=? AND ended_epoch IS NULL
                 """,
-                (effective_at_epoch, guild_id),
+                (effective_at_epoch, close_reason, guild_id),
             )
         if new_channel_id is not None:
             conn.execute(
