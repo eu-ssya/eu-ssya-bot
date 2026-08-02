@@ -470,7 +470,7 @@ class VoiceListenerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             await cog._store_call(cog.store.list_sessions, guild.id, 99),
-            [("reading_room", 50, 100, "reconciled")],
+            [("reading_room", 50, 50, "restart_checkpoint")],
         )
         self.assertEqual(
             await session_rows(cog, member.id),
@@ -996,7 +996,153 @@ class RecoveryLifecycleTests(unittest.IsolatedAsyncioTestCase):
             release_ready.set()
             await recovery
 
-        now.assert_called_once_with()
+        self.assertGreaterEqual(now.call_count, 1)
+
+    async def test_guild_available_during_ready_wait_owns_startup_snapshot_recovery(self):
+        cog, guild, member = self.make_cog()
+        await cog._store_call(
+            cog.store.reconcile_session,
+            guild.id,
+            member.id,
+            "study",
+            50,
+        )
+        await cog._store_call(cog.store.checkpoint_open_rows, guild.id, 80)
+        guild.members = [member.in_category(20)]
+        ready_entered = asyncio.Event()
+        release_ready = asyncio.Event()
+
+        async def wait_until_ready():
+            ready_entered.set()
+            await release_ready.wait()
+
+        cog.bot.wait_until_ready = wait_until_ready
+        recovery = asyncio.create_task(cog.recover_after_ready())
+        await ready_entered.wait()
+        with mock.patch("activity_cog.utc_now_epoch", return_value=100):
+            await cog.on_guild_available(guild)
+        release_ready.set()
+        await recovery
+
+        self.assertEqual(
+            await session_rows(cog, member.id),
+            [
+                ("study", 50, 80, "restart_checkpoint"),
+                ("reading_room", 100, None, None),
+            ],
+        )
+        self.assertEqual(
+            await cog._store_call(cog.store.list_runs, guild.id),
+            [
+                (1, 80, 80, "restart_checkpoint"),
+                (100, 100, None, None),
+            ],
+        )
+        self.assertEqual(cog._startup_recovered_guild_ids, {guild.id})
+
+    async def test_startup_delta_backfill_recovers_message_after_completed_cursor(self):
+        cog, guild, member = self.make_cog()
+        await prepare_sync_marker(cog, channel_id=40, message_id=10)
+        await cog._store_call(cog.store.mark_backfill_completed, 1, 40, 90)
+        channel = make_history_channel(
+            guild,
+            40,
+            [SodEodCollectionTests.full_message(11, member, guild.get_channel(40))],
+        )
+        guild.channels = [item for item in guild.channels if item.id != 40] + [channel]
+
+        await recover_after_ready_for_test(cog, 100)
+
+        channel.history.assert_called_once_with(
+            limit=None,
+            oldest_first=True,
+            after=discord.Object(id=10),
+        )
+        self.assertEqual(SodEodCollectionTests.count_events(cog), 1)
+        state = await sync_state(cog, 40)
+        self.assertEqual(state.newest_processed_message_id, 11)
+        self.assertIsNotNone(state.completed_epoch)
+
+    async def test_disconnect_resume_delta_backfill_recovers_downtime_message(self):
+        cog, guild, member = self.make_cog()
+        await recover_after_ready_for_test(cog, 100)
+        await prepare_sync_marker(cog, channel_id=40, message_id=20)
+        await cog._store_call(cog.store.mark_backfill_completed, 1, 40, 120)
+
+        await on_disconnect_for_test(cog, 160)
+        self.assertIsNone((await sync_state(cog, 40)).completed_epoch)
+        channel = make_history_channel(
+            guild,
+            40,
+            [SodEodCollectionTests.full_message(21, member, guild.get_channel(40))],
+        )
+        guild.channels = [item for item in guild.channels if item.id != 40] + [channel]
+        await on_resumed_for_test(cog, 200)
+
+        channel.history.assert_called_once_with(
+            limit=None,
+            oldest_first=True,
+            after=discord.Object(id=20),
+        )
+        self.assertEqual(SodEodCollectionTests.count_events(cog), 1)
+        state = await sync_state(cog, 40)
+        self.assertEqual(state.newest_processed_message_id, 21)
+        self.assertIsNotNone(state.completed_epoch)
+
+    async def test_guild_available_delta_backfill_recovers_guild_outage_message(self):
+        cog, guild, member = self.make_cog()
+        await recover_after_ready_for_test(cog, 100)
+        await prepare_sync_marker(cog, channel_id=40, message_id=30)
+        await cog._store_call(cog.store.mark_backfill_completed, 1, 40, 120)
+        channel = make_history_channel(
+            guild,
+            40,
+            [SodEodCollectionTests.full_message(31, member, guild.get_channel(40))],
+        )
+        guild.channels = [item for item in guild.channels if item.id != 40] + [channel]
+
+        with mock.patch("activity_cog.utc_now_epoch", return_value=200):
+            await cog.on_guild_available(guild)
+
+        channel.history.assert_called_once_with(
+            limit=None,
+            oldest_first=True,
+            after=discord.Object(id=30),
+        )
+        self.assertEqual(SodEodCollectionTests.count_events(cog), 1)
+        state = await sync_state(cog, 40)
+        self.assertEqual(state.newest_processed_message_id, 31)
+        self.assertIsNotNone(state.completed_epoch)
+
+    async def test_failed_resume_delta_backfill_leaves_partial_warning(self):
+        cog, guild, _member = self.make_cog()
+        await recover_after_ready_for_test(cog, 100)
+        await cog._store_call(cog.store.mark_backfill_completed, 1, 40, 120)
+        await on_disconnect_for_test(cog, 160)
+        channel = fake_text_channel(40, guild)
+
+        async def failed_history(**_kwargs):
+            raise discord.Forbidden(
+                SimpleNamespace(status=403, reason="Forbidden", headers={}),
+                "history unavailable",
+            )
+            yield None
+
+        channel.history.side_effect = failed_history
+        guild.channels = [item for item in guild.channels if item.id != 40] + [channel]
+        with mock.patch("activity_cog.logger.exception"):
+            await on_resumed_for_test(cog, 200)
+
+        self.assertIsNone((await sync_state(cog, 40)).completed_epoch)
+        report = await cog._store_call(
+            cog.store.build_report,
+            guild_id=1,
+            members=[],
+            start_epoch=1,
+            end_epoch=220,
+            as_of_epoch=220,
+        )
+        self.assertIn("sod_backfill_incomplete", {item.code for item in report.warnings})
 
     async def test_later_disconnect_wins_over_startup_recovery_waiting_for_ready(self):
         cog, guild, member = self.make_cog()

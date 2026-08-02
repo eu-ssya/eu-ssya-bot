@@ -197,6 +197,12 @@ def fake_text_channel(channel_id, guild, can_read=True):
         view_channel=can_read,
         read_message_history=can_read,
     )
+
+    async def empty_history(**_kwargs):
+        if False:
+            yield None
+
+    value.history.side_effect = empty_history
     return value
 
 

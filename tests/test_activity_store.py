@@ -64,6 +64,59 @@ class SchemaTests(unittest.TestCase):
         self.assertIn("COVERING INDEX", details)
         self.assertIn("guild_id=? AND user_id=?", details)
 
+    def test_initialize_migrates_legacy_config_period_epoch_checks_preserving_rows(self):
+        with closing(self.store._connect()) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE activity_config (
+                    guild_id INTEGER PRIMARY KEY,
+                    target_role_id INTEGER,
+                    reading_category_id INTEGER,
+                    study_category_id INTEGER,
+                    sod_eod_channel_id INTEGER,
+                    voice_collection_started_epoch INTEGER,
+                    created_epoch INTEGER NOT NULL,
+                    updated_epoch INTEGER NOT NULL,
+                    CHECK(reading_category_id IS NULL OR study_category_id IS NULL
+                          OR reading_category_id <> study_category_id)
+                );
+                CREATE TABLE sod_eod_channel_periods (
+                    id INTEGER PRIMARY KEY,
+                    guild_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    started_epoch INTEGER NOT NULL,
+                    ended_epoch INTEGER,
+                    ended_reason TEXT CHECK(ended_reason IN
+                        ('channel_changed','config_invalid')),
+                    CHECK((ended_epoch IS NULL AND ended_reason IS NULL)
+                          OR (ended_epoch IS NOT NULL AND ended_reason IS NOT NULL)),
+                    CHECK(ended_epoch IS NULL OR ended_epoch >= started_epoch)
+                );
+                INSERT INTO activity_config VALUES (1,10,20,30,40,100,90,110);
+                INSERT INTO sod_eod_channel_periods
+                    VALUES (1,1,40,100,110,'channel_changed');
+                """
+            )
+
+        self.store.initialize()
+
+        self.assertEqual(
+            self.store.get_config(1),
+            ActivityConfig(1, 10, 20, 30, 40, 100),
+        )
+        self.assertEqual(self.store.list_channel_periods(1), [(40, 100, 110)])
+        bad_updates = (
+            "UPDATE activity_config SET voice_collection_started_epoch=100.5",
+            "UPDATE activity_config SET created_epoch=90.5",
+            "UPDATE activity_config SET updated_epoch=110.5",
+            "UPDATE sod_eod_channel_periods SET started_epoch=100.5",
+            "UPDATE sod_eod_channel_periods SET ended_epoch=110.5",
+        )
+        for statement in bad_updates:
+            with self.subTest(statement=statement), closing(self.store._connect()) as conn:
+                with self.assertRaises(sqlite3.IntegrityError):
+                    conn.execute(statement)
+
 
 class ConfigurationTests(unittest.TestCase):
     def setUp(self):
@@ -222,6 +275,35 @@ class ConfigurationTests(unittest.TestCase):
             self._open_voice_rows(),
             ([(120, "config_changed")], [(120, "config_changed")]),
         )
+
+    def test_final_config_upsert_failure_rolls_back_voice_rows_period_and_config(self):
+        self.store.apply_config_change(
+            1,
+            target_role_id=10,
+            reading_category_id=20,
+            study_category_id=30,
+            sod_eod_channel_id=40,
+            effective_at_epoch=100,
+        )
+        self._insert_open_voice_rows()
+        before_config = self.store.get_config(1)
+        before_periods = self.store.list_channel_periods(1)
+
+        with mock.patch.object(
+            self.store,
+            "_upsert_config_in_tx",
+            side_effect=sqlite3.IntegrityError("forced final upsert failure"),
+        ), self.assertRaises(sqlite3.IntegrityError):
+            self.store.apply_config_change(
+                1,
+                reading_category_id=21,
+                sod_eod_channel_id=41,
+                effective_at_epoch=120,
+            )
+
+        self.assertEqual(self.store.get_config(1), before_config)
+        self.assertEqual(self.store.list_channel_periods(1), before_periods)
+        self.assertEqual(self._open_voice_rows(), ([(None, None)], [(None, None)]))
 
     def test_sod_only_change_preserves_open_voice_rows(self):
         self.store.apply_config_change(
@@ -1105,6 +1187,26 @@ class ReportStoreTests(unittest.TestCase):
             ),
             (30, 1, 50, 1),
         )
+
+    def test_open_voice_and_coverage_stop_at_report_as_of(self):
+        self.store.reconcile_session(1, 3, "study", 100)
+        self.store.open_collection_run(1, 100)
+
+        report = self.store.build_report(
+            guild_id=1,
+            members=[activity_store.ReportMember(3, "Bravo")],
+            start_epoch=100,
+            end_epoch=1000,
+            as_of_epoch=200,
+        )
+
+        row = report.rows[0]
+        self.assertEqual((row.study_seconds, row.study_session_count), (100, 1))
+        voice_warnings = [
+            warning for warning in report.warnings if warning.code == "voice_gap"
+        ]
+        self.assertEqual(voice_warnings, [])
+        self.assertFalse(any("200~1000" in item.text for item in report.warnings))
 
     def test_last_activity_uses_latest_preserved_record_outside_query_range(self):
         self.store.reconcile_session(1, 3, "study", 500)

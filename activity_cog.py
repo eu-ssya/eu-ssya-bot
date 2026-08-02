@@ -542,6 +542,32 @@ class ActivityCog(commands.Cog):
         )
         return self._collection_generations[guild.id] == generation
 
+    async def _recover_startup_guild_locked(
+        self,
+        guild,
+        effective_at_epoch: int,
+        generation: int,
+    ) -> bool:
+        if guild.id in self._startup_recovered_guild_ids:
+            return True
+        close_reason = (
+            "gateway_disconnect"
+            if guild.id in self._disconnect_epochs
+            else "restart_checkpoint"
+        )
+        recovered = await self._recover_suspended_guild_locked(
+            guild,
+            effective_at_epoch,
+            close_reason,
+            generation,
+        )
+        if not recovered:
+            return False
+        self._startup_recovered_guild_ids.add(guild.id)
+        self._disconnect_epochs.pop(guild.id, None)
+        await self._auto_backfill_current_channel_locked(guild, force=True)
+        return True
+
     async def recover_after_ready(self) -> None:
         guilds = [
             guild
@@ -560,20 +586,11 @@ class ActivityCog(commands.Cog):
                 async with self.guild_locks[guild.id]:
                     if guild.id in self._startup_recovered_guild_ids:
                         continue
-                    close_reason = (
-                        "gateway_disconnect"
-                        if guild.id in self._disconnect_epochs
-                        else "restart_checkpoint"
-                    )
-                    recovered = await self._recover_suspended_guild_locked(
+                    await self._recover_startup_guild_locked(
                         guild,
                         effective_at_epoch,
-                        close_reason,
                         generations[guild.id],
                     )
-                    if recovered:
-                        self._startup_recovered_guild_ids.add(guild.id)
-                        self._disconnect_epochs.pop(guild.id, None)
             except Exception:
                 logger.exception(
                     "activity startup recovery failed for guild %s",
@@ -930,95 +947,147 @@ class ActivityCog(commands.Cog):
         channel: discord.TextChannel | None = None,
     ) -> BackfillResult:
         async with self.guild_locks[guild.id]:
+            return await self._backfill_current_channel_locked(
+                guild,
+                channel=channel,
+            )
+
+    async def _mark_current_text_sync_incomplete_locked(
+        self,
+        guild,
+        updated_epoch: int,
+    ) -> bool:
+        config = await self._store_call(self.store.get_config, guild.id)
+        channel_id = config.sod_eod_channel_id
+        if channel_id is None:
+            return False
+        await self._store_call(
+            self.store.mark_backfill_started,
+            guild.id,
+            channel_id,
+            updated_epoch,
+        )
+        return True
+
+    async def _auto_backfill_current_channel_locked(
+        self,
+        guild,
+        *,
+        force: bool = False,
+    ) -> None:
+        try:
             config = await self._store_call(self.store.get_config, guild.id)
             channel_id = config.sod_eod_channel_id
             if channel_id is None:
-                raise ValueError("SoD/EoD 채널이 설정되지 않았습니다.")
-            if channel is None:
-                channel = guild.get_channel(channel_id)
-            if (
-                not self._same_guild_resource(channel, discord.TextChannel, guild)
-                or channel.id != channel_id
-            ):
-                raise ChannelChanged(channel_id)
-            if not self._text_channel_is_accessible(channel, guild):
-                raise ValueError("SoD/EoD 텍스트 채널 이력을 읽을 수 없습니다.")
-
+                return
             state = await self._store_call(
                 self.store.get_sync_state,
                 guild.id,
                 channel_id,
             )
-            after = (
-                None
-                if state is None or state.newest_processed_message_id is None
-                else discord.Object(id=state.newest_processed_message_id)
-            )
-            await self._store_call(
-                self.store.mark_backfill_started,
+            if not force and state is not None and state.completed_epoch is not None:
+                return
+            await self._backfill_current_channel_locked(guild)
+        except Exception:
+            logger.exception(
+                "activity automatic SoD/EoD delta backfill failed for guild %s",
                 guild.id,
-                channel_id,
-                utc_now_epoch(),
             )
 
-            processed_count = 0
-            event_count = 0
-            author_eligibility = OrderedDict()
-            async for message in channel.history(
-                limit=None,
-                oldest_first=True,
-                after=after,
-            ):
-                author_id = message.author.id
-                member = guild.get_member(author_id)
-                if member is not None:
-                    author_eligibility.pop(author_id, None)
-                    eligible_author = self._member_has_target_role(member, config)
-                else:
+    async def _backfill_current_channel_locked(
+        self,
+        guild,
+        *,
+        channel: discord.TextChannel | None = None,
+    ) -> BackfillResult:
+        config = await self._store_call(self.store.get_config, guild.id)
+        channel_id = config.sod_eod_channel_id
+        if channel_id is None:
+            raise ValueError("SoD/EoD 채널이 설정되지 않았습니다.")
+        state = await self._store_call(
+            self.store.get_sync_state,
+            guild.id,
+            channel_id,
+        )
+        after = (
+            None
+            if state is None or state.newest_processed_message_id is None
+            else discord.Object(id=state.newest_processed_message_id)
+        )
+        await self._store_call(
+            self.store.mark_backfill_started,
+            guild.id,
+            channel_id,
+            utc_now_epoch(),
+        )
+        if channel is None:
+            channel = guild.get_channel(channel_id)
+        if (
+            not self._same_guild_resource(channel, discord.TextChannel, guild)
+            or channel.id != channel_id
+        ):
+            raise ChannelChanged(channel_id)
+        if not self._text_channel_is_accessible(channel, guild):
+            raise ValueError("SoD/EoD 텍스트 채널 이력을 읽을 수 없습니다.")
+
+        processed_count = 0
+        event_count = 0
+        author_eligibility = OrderedDict()
+        async for message in channel.history(
+            limit=None,
+            oldest_first=True,
+            after=after,
+        ):
+            author_id = message.author.id
+            member = guild.get_member(author_id)
+            if member is not None:
+                author_eligibility.pop(author_id, None)
+                eligible_author = self._member_has_target_role(member, config)
+            else:
+                try:
+                    eligible_author = author_eligibility.pop(author_id)
+                except KeyError:
                     try:
-                        eligible_author = author_eligibility.pop(author_id)
-                    except KeyError:
-                        try:
-                            member = await guild.fetch_member(author_id)
-                        except (discord.NotFound, discord.Forbidden):
-                            member = None
-                        eligible_author = self._member_has_target_role(member, config)
-                    author_eligibility[author_id] = eligible_author
-                    if len(author_eligibility) > AUTHOR_ELIGIBILITY_CACHE_LIMIT:
-                        author_eligibility.popitem(last=False)
+                        member = await guild.fetch_member(author_id)
+                    except (discord.NotFound, discord.Forbidden):
+                        member = None
+                    eligible_author = self._member_has_target_role(member, config)
+                author_eligibility[author_id] = eligible_author
+                if len(author_eligibility) > AUTHOR_ELIGIBILITY_CACHE_LIMIT:
+                    author_eligibility.popitem(last=False)
 
-                event_types = set()
-                if (
-                    eligible_author
-                    and self._message_envelope_is_eligible(message, guild, config)
-                ):
-                    event_types = detect_sod_eod(message.content)
-                message_created_epoch = int(message.created_at.timestamp())
-                await self._store_call(
-                    self.store.record_backfill_message_and_advance_cursor,
-                    guild_id=guild.id,
-                    channel_id=channel_id,
-                    message_id=message.id,
-                    user_id=author_id,
-                    message_created_epoch=message_created_epoch,
-                    event_types=event_types,
-                    newest_processed_message_created_epoch=message_created_epoch,
-                    updated_epoch=utc_now_epoch(),
-                    expected_current_channel_id=channel_id,
-                )
-                processed_count += 1
-                event_count += len(event_types)
-
-            current = await self._store_call(self.store.get_config, guild.id)
-            if current.sod_eod_channel_id != channel_id:
-                raise ChannelChanged(channel_id)
+            event_types = set()
+            if (
+                eligible_author
+                and self._message_envelope_is_eligible(message, guild, config)
+            ):
+                event_types = detect_sod_eod(message.content)
+            message_created_epoch = int(message.created_at.timestamp())
             await self._store_call(
-                self.store.mark_backfill_completed,
-                guild.id,
-                channel_id,
-                utc_now_epoch(),
+                self.store.record_backfill_message_and_advance_cursor,
+                guild_id=guild.id,
+                channel_id=channel_id,
+                message_id=message.id,
+                user_id=author_id,
+                message_created_epoch=message_created_epoch,
+                event_types=event_types,
+                newest_processed_message_created_epoch=message_created_epoch,
+                updated_epoch=utc_now_epoch(),
+                expected_current_channel_id=channel_id,
             )
-            return BackfillResult(processed_count, event_count)
+            processed_count += 1
+            event_count += len(event_types)
+
+        current = await self._store_call(self.store.get_config, guild.id)
+        if current.sod_eod_channel_id != channel_id:
+            raise ChannelChanged(channel_id)
+        await self._store_call(
+            self.store.mark_backfill_completed,
+            guild.id,
+            channel_id,
+            utc_now_epoch(),
+        )
+        return BackfillResult(processed_count, event_count)
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after) -> None:
@@ -1091,6 +1160,17 @@ class ActivityCog(commands.Cog):
             disconnect_epoch = self._disconnect_epochs[guild.id]
             try:
                 async with self.guild_locks[guild.id]:
+                    try:
+                        await self._mark_current_text_sync_incomplete_locked(
+                            guild,
+                            disconnect_epoch,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "activity disconnect text sync invalidation failed "
+                            "for guild %s",
+                            guild.id,
+                        )
                     await self._store_call(
                         self.store.close_open_rows,
                         guild.id,
@@ -1111,19 +1191,33 @@ class ActivityCog(commands.Cog):
         for guild in guilds:
             try:
                 async with self.guild_locks[guild.id]:
-                    close_reason = (
-                        "gateway_disconnect"
-                        if guild.id in self._disconnect_epochs
-                        else "restart_checkpoint"
+                    needs_startup_recovery = (
+                        guild.id not in self._startup_recovered_guild_ids
                     )
-                    recovered = await self._recover_suspended_guild_locked(
-                        guild,
-                        effective_at_epoch,
-                        close_reason,
-                        generations[guild.id],
-                    )
-                    if recovered:
+                    if needs_startup_recovery:
+                        recovered = await self._recover_startup_guild_locked(
+                            guild,
+                            effective_at_epoch,
+                            generations[guild.id],
+                        )
+                    else:
+                        close_reason = (
+                            "gateway_disconnect"
+                            if guild.id in self._disconnect_epochs
+                            else "restart_checkpoint"
+                        )
+                        recovered = await self._recover_suspended_guild_locked(
+                            guild,
+                            effective_at_epoch,
+                            close_reason,
+                            generations[guild.id],
+                        )
+                    if recovered and not needs_startup_recovery:
                         self._disconnect_epochs.pop(guild.id, None)
+                        await self._auto_backfill_current_channel_locked(
+                            guild,
+                            force=close_reason == "gateway_disconnect",
+                        )
             except Exception:
                 logger.exception(
                     "activity resume recovery failed for guild %s",
@@ -1133,13 +1227,22 @@ class ActivityCog(commands.Cog):
     @commands.Cog.listener()
     async def on_guild_available(self, guild) -> None:
         had_pending_disconnect = guild.id in self._disconnect_epochs
+        needs_startup_recovery = (
+            guild.id not in self._startup_recovered_guild_ids
+        )
         generation = self._suspend_collection((guild,))[guild.id]
         effective_at_epoch = utc_now_epoch()
         try:
             async with self.guild_locks[guild.id]:
                 if self._collection_generations[guild.id] != generation:
                     return
-                if had_pending_disconnect:
+                if needs_startup_recovery:
+                    recovered = await self._recover_startup_guild_locked(
+                        guild,
+                        effective_at_epoch,
+                        generation,
+                    )
+                elif had_pending_disconnect:
                     recovered = await self._recover_suspended_guild_locked(
                         guild,
                         effective_at_epoch,
@@ -1155,8 +1258,21 @@ class ActivityCog(commands.Cog):
                     recovered = (
                         self._collection_generations[guild.id] == generation
                     )
-                if recovered and had_pending_disconnect:
+                if (
+                    recovered
+                    and had_pending_disconnect
+                    and not needs_startup_recovery
+                ):
                     self._disconnect_epochs.pop(guild.id, None)
+                    await self._auto_backfill_current_channel_locked(
+                        guild,
+                        force=True,
+                    )
+                elif recovered and not needs_startup_recovery:
+                    await self._auto_backfill_current_channel_locked(
+                        guild,
+                        force=True,
+                    )
         except Exception:
             logger.exception(
                 "activity guild-available recovery failed for guild %s",

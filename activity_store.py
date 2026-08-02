@@ -120,13 +120,13 @@ class ChannelChanged(RuntimeError):
 
 
 SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS activity_config (guild_id INTEGER PRIMARY KEY,target_role_id INTEGER,reading_category_id INTEGER,study_category_id INTEGER,sod_eod_channel_id INTEGER,voice_collection_started_epoch INTEGER,created_epoch INTEGER NOT NULL,updated_epoch INTEGER NOT NULL,CHECK(reading_category_id IS NULL OR study_category_id IS NULL OR reading_category_id <> study_category_id));
+CREATE TABLE IF NOT EXISTS activity_config (guild_id INTEGER PRIMARY KEY,target_role_id INTEGER,reading_category_id INTEGER,study_category_id INTEGER,sod_eod_channel_id INTEGER,voice_collection_started_epoch INTEGER CHECK(voice_collection_started_epoch IS NULL OR typeof(voice_collection_started_epoch)='integer'),created_epoch INTEGER NOT NULL CHECK(typeof(created_epoch)='integer'),updated_epoch INTEGER NOT NULL CHECK(typeof(updated_epoch)='integer'),CHECK(reading_category_id IS NULL OR study_category_id IS NULL OR reading_category_id <> study_category_id));
 CREATE TABLE IF NOT EXISTS voice_sessions (id INTEGER PRIMARY KEY,guild_id INTEGER NOT NULL,user_id INTEGER NOT NULL,activity_kind TEXT NOT NULL CHECK(activity_kind IN ('reading_room','study')),started_epoch INTEGER NOT NULL,last_checkpoint_epoch INTEGER NOT NULL,ended_epoch INTEGER,closed_reason TEXT CHECK(closed_reason IN ('normal','category_change','role_removed','config_changed','reconciled','gateway_disconnect','restart_checkpoint')),CHECK(typeof(started_epoch)='integer'),CHECK(typeof(last_checkpoint_epoch)='integer'),CHECK(ended_epoch IS NULL OR typeof(ended_epoch)='integer'),CHECK(last_checkpoint_epoch >= started_epoch),CHECK((ended_epoch IS NULL AND closed_reason IS NULL) OR (ended_epoch IS NOT NULL AND closed_reason IS NOT NULL)),CHECK(ended_epoch IS NULL OR ended_epoch >= last_checkpoint_epoch));
 CREATE TABLE IF NOT EXISTS voice_collection_runs (id INTEGER PRIMARY KEY,guild_id INTEGER NOT NULL,started_epoch INTEGER NOT NULL,last_checkpoint_epoch INTEGER NOT NULL,ended_epoch INTEGER,ended_reason TEXT CHECK(ended_reason IN ('config_changed','config_invalid','graceful_shutdown','gateway_disconnect','restart_checkpoint')),CHECK(typeof(started_epoch)='integer'),CHECK(typeof(last_checkpoint_epoch)='integer'),CHECK(ended_epoch IS NULL OR typeof(ended_epoch)='integer'),CHECK(last_checkpoint_epoch >= started_epoch),CHECK((ended_epoch IS NULL AND ended_reason IS NULL) OR (ended_epoch IS NOT NULL AND ended_reason IS NOT NULL)),CHECK(ended_epoch IS NULL OR ended_epoch >= last_checkpoint_epoch));
 CREATE TABLE IF NOT EXISTS sod_eod_events (message_id INTEGER NOT NULL,guild_id INTEGER NOT NULL,user_id INTEGER NOT NULL,event_date_kst TEXT NOT NULL,event_type TEXT NOT NULL CHECK(event_type IN ('sod','eod')),message_created_epoch INTEGER NOT NULL CHECK(typeof(message_created_epoch)='integer'),channel_id INTEGER NOT NULL,PRIMARY KEY(message_id,event_type));
 CREATE TABLE IF NOT EXISTS sod_eod_daily (guild_id INTEGER NOT NULL,user_id INTEGER NOT NULL,event_date_kst TEXT NOT NULL,event_type TEXT NOT NULL CHECK(event_type IN ('sod','eod')),PRIMARY KEY(guild_id,user_id,event_date_kst,event_type));
 CREATE TABLE IF NOT EXISTS activity_sync_state (guild_id INTEGER NOT NULL,channel_id INTEGER NOT NULL,newest_processed_message_id INTEGER,newest_processed_message_created_epoch INTEGER CHECK(newest_processed_message_created_epoch IS NULL OR typeof(newest_processed_message_created_epoch)='integer'),history_from_epoch INTEGER CHECK(history_from_epoch IS NULL OR typeof(history_from_epoch)='integer'),completed_epoch INTEGER CHECK(completed_epoch IS NULL OR typeof(completed_epoch)='integer'),updated_epoch INTEGER NOT NULL CHECK(typeof(updated_epoch)='integer'),PRIMARY KEY(guild_id,channel_id));
-CREATE TABLE IF NOT EXISTS sod_eod_channel_periods (id INTEGER PRIMARY KEY,guild_id INTEGER NOT NULL,channel_id INTEGER NOT NULL,started_epoch INTEGER NOT NULL,ended_epoch INTEGER,ended_reason TEXT CHECK(ended_reason IN ('channel_changed','config_invalid')),CHECK((ended_epoch IS NULL AND ended_reason IS NULL) OR (ended_epoch IS NOT NULL AND ended_reason IS NOT NULL)),CHECK(ended_epoch IS NULL OR ended_epoch >= started_epoch));
+CREATE TABLE IF NOT EXISTS sod_eod_channel_periods (id INTEGER PRIMARY KEY,guild_id INTEGER NOT NULL,channel_id INTEGER NOT NULL,started_epoch INTEGER NOT NULL CHECK(typeof(started_epoch)='integer'),ended_epoch INTEGER CHECK(ended_epoch IS NULL OR typeof(ended_epoch)='integer'),ended_reason TEXT CHECK(ended_reason IN ('channel_changed','config_invalid')),CHECK((ended_epoch IS NULL AND ended_reason IS NULL) OR (ended_epoch IS NOT NULL AND ended_reason IS NOT NULL)),CHECK(ended_epoch IS NULL OR ended_epoch >= started_epoch));
 CREATE UNIQUE INDEX IF NOT EXISTS idx_voice_sessions_one_open_per_member ON voice_sessions(guild_id,user_id) WHERE ended_epoch IS NULL;
 CREATE INDEX IF NOT EXISTS idx_voice_sessions_report ON voice_sessions(guild_id,user_id,activity_kind,started_epoch,ended_epoch);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_voice_collection_runs_one_open ON voice_collection_runs(guild_id) WHERE ended_epoch IS NULL;
@@ -153,7 +153,142 @@ class ActivityStore:
     def initialize(self):
         with closing(self._connect()) as conn:
             conn.executescript(SCHEMA_SQL)
+            self._migrate_epoch_constraints(conn)
             conn.commit()
+
+    @staticmethod
+    def _migrate_epoch_constraints(conn) -> None:
+        table_sql = {
+            table_name: (sql or "").casefold().replace(" ", "")
+            for table_name, sql in conn.execute(
+                """
+                SELECT name, sql
+                FROM sqlite_master
+                WHERE type='table'
+                  AND name IN ('activity_config', 'sod_eod_channel_periods')
+                """
+            )
+        }
+        config_needs_migration = (
+            "typeof(voice_collection_started_epoch)='integer'"
+            not in table_sql.get("activity_config", "")
+        )
+        periods_need_migration = (
+            "typeof(started_epoch)='integer'"
+            not in table_sql.get("sod_eod_channel_periods", "")
+        )
+        if not config_needs_migration and not periods_need_migration:
+            return
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if config_needs_migration:
+                conn.execute("DROP TABLE IF EXISTS activity_config_epoch_migration")
+                conn.execute(
+                    """
+                    CREATE TABLE activity_config_epoch_migration (
+                        guild_id INTEGER PRIMARY KEY,
+                        target_role_id INTEGER,
+                        reading_category_id INTEGER,
+                        study_category_id INTEGER,
+                        sod_eod_channel_id INTEGER,
+                        voice_collection_started_epoch INTEGER CHECK(
+                            voice_collection_started_epoch IS NULL OR
+                            typeof(voice_collection_started_epoch)='integer'
+                        ),
+                        created_epoch INTEGER NOT NULL CHECK(
+                            typeof(created_epoch)='integer'
+                        ),
+                        updated_epoch INTEGER NOT NULL CHECK(
+                            typeof(updated_epoch)='integer'
+                        ),
+                        CHECK(
+                            reading_category_id IS NULL OR
+                            study_category_id IS NULL OR
+                            reading_category_id <> study_category_id
+                        )
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO activity_config_epoch_migration
+                    SELECT guild_id, target_role_id, reading_category_id,
+                           study_category_id, sod_eod_channel_id,
+                           voice_collection_started_epoch, created_epoch,
+                           updated_epoch
+                    FROM activity_config
+                    """
+                )
+                conn.execute("DROP TABLE activity_config")
+                conn.execute(
+                    """
+                    ALTER TABLE activity_config_epoch_migration
+                    RENAME TO activity_config
+                    """
+                )
+
+            if periods_need_migration:
+                conn.execute(
+                    "DROP TABLE IF EXISTS sod_eod_channel_periods_epoch_migration"
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE sod_eod_channel_periods_epoch_migration (
+                        id INTEGER PRIMARY KEY,
+                        guild_id INTEGER NOT NULL,
+                        channel_id INTEGER NOT NULL,
+                        started_epoch INTEGER NOT NULL CHECK(
+                            typeof(started_epoch)='integer'
+                        ),
+                        ended_epoch INTEGER CHECK(
+                            ended_epoch IS NULL OR typeof(ended_epoch)='integer'
+                        ),
+                        ended_reason TEXT CHECK(
+                            ended_reason IN ('channel_changed','config_invalid')
+                        ),
+                        CHECK(
+                            (ended_epoch IS NULL AND ended_reason IS NULL) OR
+                            (ended_epoch IS NOT NULL AND ended_reason IS NOT NULL)
+                        ),
+                        CHECK(ended_epoch IS NULL OR ended_epoch >= started_epoch)
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO sod_eod_channel_periods_epoch_migration
+                    SELECT id, guild_id, channel_id, started_epoch,
+                           ended_epoch, ended_reason
+                    FROM sod_eod_channel_periods
+                    """
+                )
+                conn.execute("DROP TABLE sod_eod_channel_periods")
+                conn.execute(
+                    """
+                    ALTER TABLE sod_eod_channel_periods_epoch_migration
+                    RENAME TO sod_eod_channel_periods
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE UNIQUE INDEX idx_sod_eod_channel_periods_one_open
+                    ON sod_eod_channel_periods(guild_id)
+                    WHERE ended_epoch IS NULL
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE INDEX idx_sod_eod_channel_periods_coverage
+                    ON sod_eod_channel_periods(
+                        guild_id, channel_id, started_epoch, ended_epoch
+                    )
+                    """
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
     def table_names(self) -> list[str]:
         with closing(self._connect()) as conn:
@@ -569,6 +704,7 @@ class ActivityStore:
             end_epoch=end_epoch,
             as_of_epoch=as_of_epoch,
         )
+        observation_end_epoch = min(end_epoch, as_of_epoch)
         start_date = datetime.fromtimestamp(start_epoch, KST).date()
         end_date = datetime.fromtimestamp(end_epoch - 1, KST).date()
         member_ids = list(dict.fromkeys(member.user_id for member in members))
@@ -599,12 +735,14 @@ class ActivityStore:
                         started,
                         ended,
                         start_epoch,
-                        end_epoch,
+                        observation_end_epoch,
                     )
                     voice_totals[user_id][activity_kind][0] += overlap
                     if overlap > 0:
                         voice_totals[user_id][activity_kind][1] += 1
-                    activity_epoch = as_of_epoch if ended is None else ended
+                    activity_epoch = (
+                        as_of_epoch if ended is None else min(ended, as_of_epoch)
+                    )
                     previous = last_activity_by_user.get(user_id)
                     if previous is None or activity_epoch > previous:
                         last_activity_by_user[user_id] = activity_epoch
@@ -683,7 +821,7 @@ class ActivityStore:
         warnings = self._build_report_warnings(
             guild_id=guild_id,
             start_epoch=start_epoch,
-            end_epoch=end_epoch,
+            end_epoch=observation_end_epoch,
         )
         return ActivityReport(
             rows=rows,
@@ -707,6 +845,8 @@ class ActivityStore:
         start_epoch: int,
         end_epoch: int,
     ) -> list[CoverageWarning]:
+        if end_epoch <= start_epoch:
+            return []
         warnings = [
             CoverageWarning(
                 code="voice_gap",
