@@ -140,15 +140,65 @@ class SchemaTests(unittest.TestCase):
         self.store.initialize()
 
         completed_empty = self.store.get_sync_state(1, 10)
-        self.assertEqual(completed_empty.initialized_epoch, 200)
-        self.assertEqual(
-            completed_empty.newest_processed_message_created_epoch,
-            200,
-        )
-        self.assertIsNotNone(completed_empty.newest_processed_message_id)
+        self.assertIsNone(completed_empty.initialized_epoch)
+        self.assertIsNone(completed_empty.completed_epoch)
+        self.assertIsNone(completed_empty.newest_processed_message_id)
+        self.assertIsNone(completed_empty.newest_processed_message_created_epoch)
         interrupted = self.store.get_sync_state(1, 11)
         self.assertEqual(interrupted.initialized_epoch, 150)
         self.assertEqual(interrupted.newest_processed_message_id, 123)
+
+    def test_initialize_resets_prior_synthetic_cursor_but_preserves_real_cursor(self):
+        self.store.initialize()
+        barrier_epoch = 1_800_000_000
+        prior_synthetic_marker = (
+            (barrier_epoch * 1000 - 1_420_070_400_000) << 22
+        )
+        with closing(self.store._connect()) as conn:
+            conn.executemany(
+                """
+                INSERT INTO activity_sync_state(
+                    guild_id, channel_id, newest_processed_message_id,
+                    newest_processed_message_created_epoch, history_from_epoch,
+                    completed_epoch, initialized_epoch, updated_epoch
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        1,
+                        12,
+                        prior_synthetic_marker,
+                        barrier_epoch,
+                        None,
+                        barrier_epoch + 100,
+                        barrier_epoch,
+                        barrier_epoch + 100,
+                    ),
+                    (
+                        1,
+                        13,
+                        prior_synthetic_marker,
+                        barrier_epoch,
+                        barrier_epoch,
+                        barrier_epoch + 100,
+                        barrier_epoch,
+                        barrier_epoch + 100,
+                    ),
+                ],
+            )
+            conn.commit()
+
+        self.store.initialize()
+
+        synthetic = self.store.get_sync_state(1, 12)
+        self.assertIsNone(synthetic.newest_processed_message_id)
+        self.assertIsNone(synthetic.newest_processed_message_created_epoch)
+        self.assertIsNone(synthetic.completed_epoch)
+        self.assertIsNone(synthetic.initialized_epoch)
+        real = self.store.get_sync_state(1, 13)
+        self.assertEqual(real.newest_processed_message_id, prior_synthetic_marker)
+        self.assertEqual(real.history_from_epoch, barrier_epoch)
+        self.assertEqual(real.initialized_epoch, barrier_epoch)
 
 
 class ConfigurationTests(unittest.TestCase):

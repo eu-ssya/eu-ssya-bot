@@ -17,6 +17,7 @@ from activity_store import (
     ActivityReport,
     ActivityStore,
     ChannelChanged,
+    CoverageWarning,
     KST,
     ReportMember,
     ReportRow,
@@ -376,10 +377,12 @@ class ActivityCog(commands.Cog):
         self._collection_generations = defaultdict(int)
         self._disconnect_epochs = {}
         self._guild_unavailable_epochs = {}
+        self._guild_available_recovery_requests = set()
         self._startup_recovered_guild_ids = set()
         self._lifecycle_tasks = set()
         self._store_worker_tasks = set()
         self._text_sync_retry_tasks = {}
+        self._text_recovery_pending_guild_ids = set()
         self.text_sync_retry_delay_seconds = TEXT_SYNC_RETRY_DELAY_SECONDS
         self._unloading = False
         self.recovery_task = None
@@ -431,6 +434,24 @@ class ActivityCog(commands.Cog):
                     end_epoch=end_epoch,
                     as_of_epoch=generated_epoch,
                 )
+                if (
+                    guild.id in self._text_recovery_pending_guild_ids
+                    and "sod_backfill_incomplete"
+                    not in {warning.code for warning in report.warnings}
+                ):
+                    report = dataclasses.replace(
+                        report,
+                        warnings=[
+                            *report.warnings,
+                            CoverageWarning(
+                                code="sod_backfill_incomplete",
+                                text=(
+                                    "SoD/EoD 자동 동기화 준비가 완료되지 않았습니다; "
+                                    "이 조회의 값은 부분 데이터입니다."
+                                ),
+                            ),
+                        ],
+                    )
                 report = dataclasses.replace(
                     report,
                     generated_epoch=generated_epoch,
@@ -604,7 +625,7 @@ class ActivityCog(commands.Cog):
     ) -> None:
         if guild.id in self._startup_recovered_guild_ids:
             await self._store_call(
-                self.store.close_open_rows,
+                self.store.close_open_rows_through_epoch,
                 guild.id,
                 outage_epoch,
                 "gateway_disconnect",
@@ -651,6 +672,7 @@ class ActivityCog(commands.Cog):
         self._startup_recovered_guild_ids.add(guild.id)
         self._disconnect_epochs.pop(guild.id, None)
         self._guild_unavailable_epochs.pop(guild.id, None)
+        self._guild_available_recovery_requests.discard(guild.id)
         if not await self._finish_current_text_recovery_locked(guild, text_state):
             self._schedule_text_sync_retry(guild)
         return True
@@ -1055,6 +1077,7 @@ class ActivityCog(commands.Cog):
                 updated_epoch,
             )
         except Exception:
+            self._text_recovery_pending_guild_ids.add(guild.id)
             logger.exception(
                 "activity SoD/EoD recovery preparation failed for guild %s",
                 guild.id,
@@ -1070,12 +1093,14 @@ class ActivityCog(commands.Cog):
         if state is _TEXT_RECOVERY_PREPARE_FAILED:
             return False
         if state is None or state.initialized_epoch is None:
+            self._text_recovery_pending_guild_ids.discard(guild.id)
             return True
         try:
             await self._backfill_current_channel_locked(
                 guild,
                 automatic_state=state,
             )
+            self._text_recovery_pending_guild_ids.discard(guild.id)
             return True
         except Exception:
             logger.exception(
@@ -1130,6 +1155,7 @@ class ActivityCog(commands.Cog):
         if not self._text_channel_is_accessible(channel, guild):
             raise ValueError("SoD/EoD 텍스트 채널 이력을 읽을 수 없습니다.")
 
+        scan_barrier_epoch = utc_now_epoch()
         processed_count = 0
         event_count = 0
         author_eligibility = OrderedDict()
@@ -1186,6 +1212,7 @@ class ActivityCog(commands.Cog):
             guild.id,
             channel_id,
             utc_now_epoch(),
+            empty_scan_cursor_epoch=scan_barrier_epoch,
         )
         return BackfillResult(processed_count, event_count)
 
@@ -1277,6 +1304,7 @@ class ActivityCog(commands.Cog):
     @commands.Cog.listener()
     async def on_guild_unavailable(self, guild) -> None:
         observed_epoch = utc_now_epoch()
+        self._guild_available_recovery_requests.discard(guild.id)
         generation = self._suspend_collection((guild,))[guild.id]
         self._guild_unavailable_epochs.setdefault(guild.id, observed_epoch)
         outage_epoch = self._guild_unavailable_epochs[guild.id]
@@ -1306,7 +1334,14 @@ class ActivityCog(commands.Cog):
         for guild in guilds:
             try:
                 async with self.guild_locks[guild.id]:
-                    if guild.id in self._guild_unavailable_epochs:
+                    guild_outage_epoch = self._guild_unavailable_epochs.get(guild.id)
+                    available_recovery_requested = (
+                        guild.id in self._guild_available_recovery_requests
+                    )
+                    if (
+                        guild_outage_epoch is not None
+                        and not available_recovery_requested
+                    ):
                         await self._prepare_current_text_recovery_locked(
                             guild,
                             effective_at_epoch,
@@ -1329,9 +1364,17 @@ class ActivityCog(commands.Cog):
                         )
                         close_reason = (
                             "gateway_disconnect"
-                            if guild.id in self._disconnect_epochs
+                            if (
+                                guild.id in self._disconnect_epochs
+                                or guild_outage_epoch is not None
+                            )
                             else "restart_checkpoint"
                         )
+                        if guild_outage_epoch is not None:
+                            await self._close_for_outage_locked(
+                                guild,
+                                guild_outage_epoch,
+                            )
                         recovered = await self._recover_suspended_guild_locked(
                             guild,
                             effective_at_epoch,
@@ -1340,6 +1383,8 @@ class ActivityCog(commands.Cog):
                         )
                     if recovered and not needs_startup_recovery:
                         self._disconnect_epochs.pop(guild.id, None)
+                        self._guild_unavailable_epochs.pop(guild.id, None)
+                        self._guild_available_recovery_requests.discard(guild.id)
                         if not await self._finish_current_text_recovery_locked(
                             guild,
                             text_state,
@@ -1353,8 +1398,10 @@ class ActivityCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_guild_available(self, guild) -> None:
+        self._guild_available_recovery_requests.add(guild.id)
         had_pending_disconnect = guild.id in self._disconnect_epochs
         had_guild_outage = guild.id in self._guild_unavailable_epochs
+        guild_outage_epoch = self._guild_unavailable_epochs.get(guild.id)
         needs_startup_recovery = (
             guild.id not in self._startup_recovered_guild_ids
         )
@@ -1375,6 +1422,11 @@ class ActivityCog(commands.Cog):
                         guild,
                         effective_at_epoch,
                     )
+                    if guild_outage_epoch is not None:
+                        await self._close_for_outage_locked(
+                            guild,
+                            guild_outage_epoch,
+                        )
                     if had_pending_disconnect or had_guild_outage:
                         recovered = await self._recover_suspended_guild_locked(
                             guild,
@@ -1394,6 +1446,7 @@ class ActivityCog(commands.Cog):
                     if recovered:
                         self._disconnect_epochs.pop(guild.id, None)
                         self._guild_unavailable_epochs.pop(guild.id, None)
+                        self._guild_available_recovery_requests.discard(guild.id)
                         if not await self._finish_current_text_recovery_locked(
                             guild,
                             text_state,

@@ -51,6 +51,10 @@ def discord_snowflake_floor_for_epoch(epoch: int) -> int:
     return max(1, (milliseconds - DISCORD_EPOCH_MILLISECONDS) << 22)
 
 
+def discord_snowflake_exclusive_after_for_epoch(epoch: int) -> int:
+    return max(1, discord_snowflake_floor_for_epoch(epoch) - 1)
+
+
 @dataclass(frozen=True)
 class ActivityConfig:
     guild_id: int
@@ -304,9 +308,9 @@ class ActivityStore:
         columns = {
             row[1] for row in conn.execute("PRAGMA table_info(activity_sync_state)")
         }
-        if "initialized_epoch" not in columns:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if "initialized_epoch" not in columns:
                 conn.execute(
                     """
                     ALTER TABLE activity_sync_state
@@ -316,52 +320,59 @@ class ActivityStore:
                     )
                     """
                 )
-                conn.execute(
+            prior_synthetic_rows = conn.execute(
+                """
+                SELECT guild_id, channel_id, newest_processed_message_id,
+                       newest_processed_message_created_epoch, initialized_epoch
+                FROM activity_sync_state
+                WHERE initialized_epoch IS NOT NULL
+                  AND newest_processed_message_id IS NOT NULL
+                  AND history_from_epoch IS NULL
+                  AND newest_processed_message_created_epoch=initialized_epoch
+                """
+            ).fetchall()
+            prior_synthetic_keys = [
+                (guild_id, channel_id)
+                for (
+                    guild_id,
+                    channel_id,
+                    message_id,
+                    _message_created_epoch,
+                    initialized_epoch,
+                ) in prior_synthetic_rows
+                if message_id
+                == discord_snowflake_floor_for_epoch(initialized_epoch)
+            ]
+            if prior_synthetic_keys:
+                conn.executemany(
                     """
                     UPDATE activity_sync_state
-                    SET initialized_epoch=COALESCE(
-                        completed_epoch,
-                        updated_epoch
-                    )
-                    WHERE completed_epoch IS NOT NULL
-                       OR newest_processed_message_id IS NOT NULL
-                    """
+                    SET newest_processed_message_id=NULL,
+                        newest_processed_message_created_epoch=NULL,
+                        completed_epoch=NULL,
+                        initialized_epoch=NULL
+                    WHERE guild_id=? AND channel_id=?
+                    """,
+                    prior_synthetic_keys,
                 )
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-
-        cursorless_initialized = conn.execute(
-            """
-            SELECT guild_id, channel_id, initialized_epoch
-            FROM activity_sync_state
-            WHERE initialized_epoch IS NOT NULL
-              AND newest_processed_message_id IS NULL
-            """
-        ).fetchall()
-        if not cursorless_initialized:
-            return
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            conn.executemany(
+            conn.execute(
                 """
                 UPDATE activity_sync_state
-                SET newest_processed_message_id=?,
-                    newest_processed_message_created_epoch=?
-                WHERE guild_id=? AND channel_id=?
-                  AND newest_processed_message_id IS NULL
+                SET initialized_epoch=COALESCE(
+                    initialized_epoch,
+                    completed_epoch,
+                    updated_epoch
+                )
+                WHERE newest_processed_message_id IS NOT NULL
                 """,
-                [
-                    (
-                        discord_snowflake_floor_for_epoch(initialized_epoch),
-                        initialized_epoch,
-                        guild_id,
-                        channel_id,
-                    )
-                    for guild_id, channel_id, initialized_epoch
-                    in cursorless_initialized
-                ],
+            )
+            conn.execute(
+                """
+                UPDATE activity_sync_state
+                SET initialized_epoch=NULL,
+                    completed_epoch=NULL
+                WHERE newest_processed_message_id IS NULL
+                """
             )
             conn.commit()
         except Exception:
@@ -541,6 +552,50 @@ class ActivityStore:
             try:
                 self._close_open_rows_in_tx(
                     conn, guild_id, effective_at_epoch, reason
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def close_open_rows_through_epoch(
+        self,
+        guild_id: int,
+        effective_at_epoch: int,
+        reason: str,
+    ) -> None:
+        _require_integer_epochs(effective_at_epoch=effective_at_epoch)
+        session_reason = "reconciled" if reason == "graceful_shutdown" else reason
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    """
+                    UPDATE voice_sessions
+                    SET ended_epoch=?, closed_reason=?
+                    WHERE guild_id=? AND ended_epoch IS NULL
+                      AND last_checkpoint_epoch<=?
+                    """,
+                    (
+                        effective_at_epoch,
+                        session_reason,
+                        guild_id,
+                        effective_at_epoch,
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE voice_collection_runs
+                    SET ended_epoch=?, ended_reason=?
+                    WHERE guild_id=? AND ended_epoch IS NULL
+                      AND last_checkpoint_epoch<=?
+                    """,
+                    (
+                        effective_at_epoch,
+                        reason,
+                        guild_id,
+                        effective_at_epoch,
+                    ),
                 )
                 conn.commit()
             except Exception:
@@ -1416,13 +1471,27 @@ class ActivityStore:
                 raise
 
     def mark_backfill_completed(
-        self, guild_id: int, channel_id: int, completed_epoch: int
+        self,
+        guild_id: int,
+        channel_id: int,
+        completed_epoch: int,
+        *,
+        empty_scan_cursor_epoch: int | None = None,
     ) -> None:
         _require_integer_epochs(completed_epoch=completed_epoch)
+        if empty_scan_cursor_epoch is not None:
+            _require_integer_epochs(empty_scan_cursor_epoch=empty_scan_cursor_epoch)
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                empty_marker = discord_snowflake_floor_for_epoch(completed_epoch)
+                cursor_epoch = (
+                    completed_epoch
+                    if empty_scan_cursor_epoch is None
+                    else empty_scan_cursor_epoch
+                )
+                empty_marker = discord_snowflake_exclusive_after_for_epoch(
+                    cursor_epoch
+                )
                 conn.execute(
                     """
                     INSERT INTO activity_sync_state(
@@ -1450,7 +1519,7 @@ class ActivityStore:
                         guild_id,
                         channel_id,
                         empty_marker,
-                        completed_epoch,
+                        cursor_epoch,
                         completed_epoch,
                         completed_epoch,
                         completed_epoch,
