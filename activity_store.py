@@ -408,7 +408,7 @@ class ActivityStore:
                 conn.execute(
                     """
                     UPDATE voice_sessions
-                    SET last_checkpoint_epoch=?
+                    SET last_checkpoint_epoch=MAX(last_checkpoint_epoch, ?)
                     WHERE guild_id=? AND ended_epoch IS NULL
                     """,
                     (checkpoint_epoch, guild_id),
@@ -416,7 +416,7 @@ class ActivityStore:
                 conn.execute(
                     """
                     UPDATE voice_collection_runs
-                    SET last_checkpoint_epoch=?
+                    SET last_checkpoint_epoch=MAX(last_checkpoint_epoch, ?)
                     WHERE guild_id=? AND ended_epoch IS NULL
                     """,
                     (checkpoint_epoch, guild_id),

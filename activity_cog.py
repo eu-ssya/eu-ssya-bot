@@ -54,12 +54,30 @@ class ActivityCog(commands.Cog):
         self._disconnect_epochs = {}
         self._startup_recovered_guild_ids = set()
         self._lifecycle_tasks = set()
+        self._store_worker_tasks = set()
         self.recovery_task = None
         self.checkpoint_task = None
 
     async def _store_call(self, method, *args, **kwargs):
         async with self.store_lock:
-            return await asyncio.to_thread(method, *args, **kwargs)
+            worker = asyncio.create_task(
+                asyncio.to_thread(method, *args, **kwargs)
+            )
+            self._store_worker_tasks.add(worker)
+            worker.add_done_callback(self._store_worker_tasks.discard)
+            try:
+                return await asyncio.shield(worker)
+            except asyncio.CancelledError as cancellation:
+                while not worker.done():
+                    try:
+                        await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        continue
+                try:
+                    worker.result()
+                except BaseException:
+                    pass
+                raise cancellation
 
     def _track_lifecycle_task(self, task):
         self._lifecycle_tasks.add(task)
@@ -83,6 +101,8 @@ class ActivityCog(commands.Cog):
         close_reason: str,
         generation: int,
     ) -> bool:
+        if self._collection_generations[guild.id] != generation:
+            return False
         snapshot = await self._store_call(
             self.store.snapshot_open_row_ids,
             guild.id,
@@ -92,23 +112,31 @@ class ActivityCog(commands.Cog):
             snapshot,
             close_reason,
         )
-        await self._full_reconcile_guild_locked(guild, effective_at_epoch)
-        if self._collection_generations[guild.id] != generation:
-            self.collection_gates[guild.id].clear()
-            return False
-        return True
+        await self._full_reconcile_guild_locked(
+            guild,
+            effective_at_epoch,
+            expected_generation=generation,
+        )
+        return self._collection_generations[guild.id] == generation
 
     async def recover_after_ready(self) -> None:
+        guilds = [
+            guild
+            for guild in list(self.bot.guilds)
+            if guild.id not in self._startup_recovered_guild_ids
+        ]
+        generations = self._suspend_collection(guilds)
         await self.bot.wait_until_ready()
         effective_at_epoch = utc_now_epoch()
         for guild in list(self.bot.guilds):
             if guild.id in self._startup_recovered_guild_ids:
                 continue
+            if guild.id not in generations:
+                generations.update(self._suspend_collection((guild,)))
             try:
                 async with self.guild_locks[guild.id]:
                     if guild.id in self._startup_recovered_guild_ids:
                         continue
-                    generation = self._suspend_collection((guild,))[guild.id]
                     close_reason = (
                         "gateway_disconnect"
                         if guild.id in self._disconnect_epochs
@@ -118,7 +146,7 @@ class ActivityCog(commands.Cog):
                         guild,
                         effective_at_epoch,
                         close_reason,
-                        generation,
+                        generations[guild.id],
                     )
                     if recovered:
                         self._startup_recovered_guild_ids.add(guild.id)
@@ -134,12 +162,12 @@ class ActivityCog(commands.Cog):
         await self._checkpoint_open_rows_once()
 
     async def _checkpoint_open_rows_once(self) -> None:
-        checkpoint_epoch = utc_now_epoch()
         for guild in list(self.bot.guilds):
             try:
                 async with self.guild_locks[guild.id]:
                     if not self.collection_gates[guild.id].is_set():
                         continue
+                    checkpoint_epoch = utc_now_epoch()
                     await self._store_call(
                         self.store.checkpoint_open_rows,
                         guild.id,
@@ -278,6 +306,7 @@ class ActivityCog(commands.Cog):
         effective_at_epoch: int,
         *,
         invalidations: list[tuple[str, str]] | None = None,
+        expected_generation: int | None = None,
     ) -> tuple[object, list[str]]:
         """Fully reconcile while the caller owns this guild's lock."""
         gate = self.collection_gates[guild.id]
@@ -340,6 +369,17 @@ class ActivityCog(commands.Cog):
             except Exception:
                 logger.exception("failed to abort activity full reconcile")
             raise
+        if (
+            expected_generation is not None
+            and self._collection_generations[guild.id] != expected_generation
+        ):
+            await self._store_call(
+                self.store.abort_full_reconcile,
+                guild.id,
+                effective_at_epoch=effective_at_epoch,
+            )
+            self.dirty_guilds.add(guild.id)
+            return config, warnings
         self.dirty_guilds.discard(guild.id)
         gate.set()
         return config, warnings
@@ -444,10 +484,12 @@ class ActivityCog(commands.Cog):
         guilds = list(self.bot.guilds)
         self._suspend_collection(guilds)
         for guild in guilds:
-            disconnect_epoch = self._disconnect_epochs.setdefault(
+            self._disconnect_epochs.setdefault(
                 guild.id,
                 observed_epoch,
             )
+        for guild in guilds:
+            disconnect_epoch = self._disconnect_epochs[guild.id]
             try:
                 async with self.guild_locks[guild.id]:
                     await self._store_call(
@@ -464,11 +506,12 @@ class ActivityCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_resumed(self) -> None:
+        guilds = list(self.bot.guilds)
+        generations = self._suspend_collection(guilds)
         effective_at_epoch = utc_now_epoch()
-        for guild in list(self.bot.guilds):
+        for guild in guilds:
             try:
                 async with self.guild_locks[guild.id]:
-                    generation = self._suspend_collection((guild,))[guild.id]
                     close_reason = (
                         "gateway_disconnect"
                         if guild.id in self._disconnect_epochs
@@ -478,7 +521,7 @@ class ActivityCog(commands.Cog):
                         guild,
                         effective_at_epoch,
                         close_reason,
-                        generation,
+                        generations[guild.id],
                     )
                     if recovered:
                         self._disconnect_epochs.pop(guild.id, None)
@@ -490,7 +533,36 @@ class ActivityCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_guild_available(self, guild) -> None:
-        await self.full_reconcile_guild(guild, utc_now_epoch())
+        had_pending_disconnect = guild.id in self._disconnect_epochs
+        generation = self._suspend_collection((guild,))[guild.id]
+        effective_at_epoch = utc_now_epoch()
+        try:
+            async with self.guild_locks[guild.id]:
+                if self._collection_generations[guild.id] != generation:
+                    return
+                if had_pending_disconnect:
+                    recovered = await self._recover_suspended_guild_locked(
+                        guild,
+                        effective_at_epoch,
+                        "gateway_disconnect",
+                        generation,
+                    )
+                else:
+                    await self._full_reconcile_guild_locked(
+                        guild,
+                        effective_at_epoch,
+                        expected_generation=generation,
+                    )
+                    recovered = (
+                        self._collection_generations[guild.id] == generation
+                    )
+                if recovered and had_pending_disconnect:
+                    self._disconnect_epochs.pop(guild.id, None)
+        except Exception:
+            logger.exception(
+                "activity guild-available recovery failed for guild %s",
+                guild.id,
+            )
 
     @commands.Cog.listener()
     async def on_guild_role_delete(self, role) -> None:
