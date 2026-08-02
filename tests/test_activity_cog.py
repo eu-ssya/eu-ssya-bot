@@ -1,13 +1,28 @@
 import asyncio
+import itertools
 import os
 import sqlite3
+import tempfile
 import threading
 import unittest
+from contextlib import closing
+from pathlib import Path
 from unittest import mock
 
-import bot as bot_module
+import discord
 
-from tests.activity_fixtures import FakeBot, FakeMember, fake_interaction
+import bot as bot_module
+from activity_store import ActivityStore
+
+from tests.activity_fixtures import (
+    FakeBot,
+    FakeGuild,
+    FakeMember,
+    fake_category,
+    fake_interaction,
+    fake_role,
+    fake_text_channel,
+)
 
 
 class FixtureContractTests(unittest.IsolatedAsyncioTestCase):
@@ -216,3 +231,400 @@ class StoreBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(self.cog.collection_gates[1], self.cog.collection_gates[1])
         self.assertIsNot(self.cog.collection_gates[1], self.cog.collection_gates[2])
         self.assertFalse(self.cog.collection_gates[1].is_set())
+
+
+class SettingsCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def make_cog(self):
+        from activity_cog import ActivityCog
+
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        store = ActivityStore(str(Path(temp_dir.name) / "activity.db"))
+        await asyncio.to_thread(store.initialize)
+        guild = FakeGuild(1)
+        guild.roles = [fake_role(10, guild)]
+        guild.channels = [
+            fake_category(20, guild),
+            fake_category(30, guild),
+            fake_text_channel(40, guild),
+        ]
+        guild.members = [FakeMember(1, guild, {10}, 20, display_name="Secret Name")]
+        bot = FakeBot()
+        bot.guilds = [guild]
+        return ActivityCog(bot, store), guild
+
+    async def invoke(self, command, cog, interaction, resource=None, *, now=100):
+        arguments = (cog, interaction) if resource is None else (cog, interaction, resource)
+        with mock.patch("activity_cog.utc_now_epoch", return_value=now):
+            await command.callback(*arguments)
+
+    async def set_complete_config(self, cog, guild, *, now=1):
+        await cog._store_call(
+            cog.store.apply_config_change,
+            guild.id,
+            target_role_id=10,
+            reading_category_id=20,
+            study_category_id=30,
+            sod_eod_channel_id=40,
+            effective_at_epoch=now,
+        )
+        cog.collection_gates[guild.id].set()
+        await cog._store_call(cog.store.open_collection_run, guild.id, now)
+
+    def test_settings_group_is_guild_only_with_admin_registration_hint(self):
+        from activity_cog import ActivityCog
+
+        self.assertTrue(ActivityCog.settings_group.guild_only)
+        self.assertTrue(ActivityCog.settings_group.default_permissions.administrator)
+
+    async def test_every_setting_order_reaches_the_same_complete_configuration(self):
+        setters = ("target_role", "reading", "study", "sod_eod")
+        for order in itertools.permutations(setters):
+            with self.subTest(order=order):
+                cog, guild = await self.make_cog()
+                resources = {
+                    "target_role": (cog.set_target_role, guild.roles[0]),
+                    "reading": (cog.set_reading_category, guild.channels[0]),
+                    "study": (cog.set_study_category, guild.channels[1]),
+                    "sod_eod": (cog.set_sod_eod_channel, guild.channels[2]),
+                }
+                for index, name in enumerate(order):
+                    command, resource = resources[name]
+                    await self.invoke(
+                        command,
+                        cog,
+                        fake_interaction(1, True, guild),
+                        resource,
+                        now=100 + index,
+                    )
+
+                config = await cog._store_call(cog.store.get_config, guild.id)
+                self.assertEqual(
+                    (
+                        config.target_role_id,
+                        config.reading_category_id,
+                        config.study_category_id,
+                        config.sod_eod_channel_id,
+                    ),
+                    (10, 20, 30, 40),
+                )
+                self.assertTrue(cog.collection_gates[guild.id].is_set())
+                self.assertEqual(
+                    await cog._store_call(cog.store.open_session_count, guild.id, 1),
+                    1,
+                )
+
+    async def test_non_admin_and_dm_guards_run_before_every_settings_mutation(self):
+        cog, guild = await self.make_cog()
+        cases = (
+            (cog.set_target_role, guild.roles[0]),
+            (cog.set_reading_category, guild.channels[0]),
+            (cog.set_study_category, guild.channels[1]),
+            (cog.set_sod_eod_channel, guild.channels[2]),
+            (cog.activity_status, None),
+        )
+        original = await cog._store_call(cog.store.get_config, guild.id)
+        for command, resource in cases:
+            with self.subTest(command=command.name, rejection="non-admin"):
+                interaction = fake_interaction(2, False, guild)
+                await self.invoke(command, cog, interaction, resource)
+                self.assertTrue(interaction.response.sent[0][1]["ephemeral"])
+                self.assertEqual(
+                    await cog._store_call(cog.store.get_config, guild.id), original
+                )
+
+            with self.subTest(command=command.name, rejection="dm"):
+                interaction = fake_interaction(1, True, guild)
+                interaction.guild = None
+                await self.invoke(command, cog, interaction, resource)
+                self.assertTrue(interaction.response.sent[0][1]["ephemeral"])
+                self.assertEqual(
+                    await cog._store_call(cog.store.get_config, guild.id), original
+                )
+
+    async def test_admin_guard_uses_ephemeral_followup_after_initial_response(self):
+        cog, guild = await self.make_cog()
+        interaction = fake_interaction(2, False, guild)
+        interaction.response.done = True
+
+        await self.invoke(cog.activity_status, cog, interaction)
+
+        self.assertEqual(interaction.response.sent, [])
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertTrue(interaction.followup.sent[0][1]["ephemeral"])
+
+    async def test_setters_reject_wrong_type_cross_guild_and_same_categories(self):
+        cog, guild = await self.make_cog()
+        await self.set_complete_config(cog, guild)
+        other = FakeGuild(2)
+        invalid_cases = (
+            (cog.set_target_role, fake_text_channel(41, guild)),
+            (cog.set_reading_category, fake_text_channel(42, guild)),
+            (cog.set_study_category, fake_text_channel(43, guild)),
+            (cog.set_sod_eod_channel, fake_category(44, guild)),
+            (cog.set_target_role, fake_role(50, other)),
+            (cog.set_reading_category, fake_category(51, other)),
+            (cog.set_study_category, fake_category(52, other)),
+            (cog.set_sod_eod_channel, fake_text_channel(53, other)),
+            (cog.set_reading_category, guild.channels[1]),
+            (cog.set_study_category, guild.channels[0]),
+        )
+        original = await cog._store_call(cog.store.get_config, guild.id)
+        for command, resource in invalid_cases:
+            with self.subTest(command=command.name, resource=resource.id):
+                interaction = fake_interaction(1, True, guild)
+                await self.invoke(command, cog, interaction, resource, now=200)
+                self.assertTrue(interaction.response.sent[0][1]["ephemeral"])
+                self.assertEqual(
+                    await cog._store_call(cog.store.get_config, guild.id), original
+                )
+
+    async def test_sod_only_change_preserves_voice_sessions_and_runs_exactly(self):
+        cog, guild = await self.make_cog()
+        await self.set_complete_config(cog, guild)
+        await cog.reconcile_member(guild.members[0], 100)
+        sessions_before = await cog._store_call(cog.store.list_sessions, 1, 1)
+        runs_before = await cog._store_call(cog.store.list_runs, 1)
+        new_channel = fake_text_channel(41, guild)
+        guild.channels.append(new_channel)
+
+        await self.invoke(
+            cog.set_sod_eod_channel,
+            cog,
+            fake_interaction(1, True, guild),
+            new_channel,
+            now=120,
+        )
+
+        self.assertEqual(
+            await cog._store_call(cog.store.list_sessions, 1, 1), sessions_before
+        )
+        self.assertEqual(await cog._store_call(cog.store.list_runs, 1), runs_before)
+
+    async def test_voice_change_closes_and_fully_reconciles_at_the_same_epoch(self):
+        cog, guild = await self.make_cog()
+        await self.set_complete_config(cog, guild)
+        await cog.reconcile_member(guild.members[0], 100)
+        replacement = fake_category(21, guild)
+        guild.channels.append(replacement)
+        guild.members = [guild.members[0].in_category(21)]
+
+        await self.invoke(
+            cog.set_reading_category,
+            cog,
+            fake_interaction(1, True, guild),
+            replacement,
+            now=150,
+        )
+
+        self.assertEqual(
+            await cog._store_call(cog.store.list_sessions, 1, 1),
+            [
+                ("reading_room", 100, 150, "config_changed"),
+                ("reading_room", 150, None, None),
+            ],
+        )
+        self.assertEqual(
+            await cog._store_call(cog.store.list_runs, 1),
+            [(1, 1, 150, "config_changed"), (150, 150, None, None)],
+        )
+
+    async def test_full_reconcile_keeps_gate_closed_when_run_open_fails(self):
+        cog, guild = await self.make_cog()
+        await cog._store_call(
+            cog.store.apply_config_change,
+            guild.id,
+            target_role_id=10,
+            reading_category_id=20,
+            study_category_id=30,
+            effective_at_epoch=1,
+        )
+        error = sqlite3.Error("run unavailable")
+
+        with mock.patch.object(
+            cog.store, "open_collection_run", side_effect=error
+        ), self.assertRaises(sqlite3.Error) as raised:
+            await cog.full_reconcile_guild(guild, 101)
+
+        self.assertIs(raised.exception, error)
+        self.assertFalse(cog.collection_gates[guild.id].is_set())
+        self.assertEqual(await cog._store_call(cog.store.list_runs, guild.id), [])
+        self.assertEqual(
+            await cog._store_call(cog.store.open_session_count, guild.id, 1), 0
+        )
+
+    async def test_full_reconcile_aborts_partial_rows_when_member_reconcile_fails(self):
+        cog, guild = await self.make_cog()
+        await cog._store_call(
+            cog.store.apply_config_change,
+            guild.id,
+            target_role_id=10,
+            reading_category_id=20,
+            study_category_id=30,
+            effective_at_epoch=1,
+        )
+        guild.members.append(FakeMember(2, guild, {10}, 20))
+        original_reconcile = cog.reconcile_member
+
+        async def fail_after_first(member, effective_at_epoch, **kwargs):
+            if member.id == 2:
+                raise sqlite3.Error("member unavailable")
+            await original_reconcile(member, effective_at_epoch, **kwargs)
+
+        with mock.patch.object(cog, "reconcile_member", side_effect=fail_after_first):
+            with self.assertRaises(sqlite3.Error):
+                await cog.full_reconcile_guild(guild, 101)
+
+        self.assertFalse(cog.collection_gates[guild.id].is_set())
+        self.assertEqual(
+            await cog._store_call(cog.store.list_sessions, guild.id, 1),
+            [("reading_room", 101, 101, "config_changed")],
+        )
+        self.assertEqual(
+            await cog._store_call(cog.store.list_runs, guild.id),
+            [(101, 101, 101, "config_invalid")],
+        )
+
+    async def test_retrying_same_voice_setting_recovers_after_reconcile_failure(self):
+        cog, guild = await self.make_cog()
+        await self.set_complete_config(cog, guild)
+        replacement = fake_category(21, guild)
+        guild.channels.append(replacement)
+        guild.members = [guild.members[0].in_category(21)]
+        first = fake_interaction(1, True, guild)
+
+        with mock.patch.object(
+            cog.store,
+            "open_collection_run",
+            side_effect=sqlite3.Error("run unavailable"),
+        ), mock.patch("activity_cog.logger.exception"):
+            await self.invoke(
+                cog.set_reading_category,
+                cog,
+                first,
+                replacement,
+                now=150,
+            )
+        self.assertFalse(cog.collection_gates[guild.id].is_set())
+
+        second = fake_interaction(1, True, guild)
+        await self.invoke(
+            cog.set_reading_category,
+            cog,
+            second,
+            replacement,
+            now=160,
+        )
+
+        self.assertTrue(cog.collection_gates[guild.id].is_set())
+        self.assertEqual(
+            await cog._store_call(cog.store.list_runs, guild.id),
+            [(1, 1, 150, "config_changed"), (160, 160, None, None)],
+        )
+        self.assertEqual(
+            await cog._store_call(cog.store.list_sessions, guild.id, 1),
+            [("reading_room", 160, None, None)],
+        )
+
+    async def test_setter_store_failure_returns_one_ephemeral_error(self):
+        cog, guild = await self.make_cog()
+        interaction = fake_interaction(1, True, guild)
+        error = sqlite3.Error("database unavailable")
+
+        with mock.patch.object(
+            cog, "_change_sod_setting", side_effect=error
+        ), mock.patch("activity_cog.logger.exception"):
+            await self.invoke(
+                cog.set_sod_eod_channel,
+                cog,
+                interaction,
+                guild.channels[2],
+            )
+
+        self.assertEqual(len(interaction.response.sent), 1)
+        content, kwargs = interaction.response.sent[0]
+        self.assertIn("처리하지 못했습니다", content)
+        self.assertTrue(kwargs["ephemeral"])
+        self.assertEqual(interaction.followup.sent, [])
+
+    async def test_status_store_failure_uses_ephemeral_followup_if_already_done(self):
+        cog, guild = await self.make_cog()
+        interaction = fake_interaction(1, True, guild)
+        interaction.response.done = True
+        error = sqlite3.Error("database unavailable")
+
+        with mock.patch.object(
+            cog, "_invalidate_configured_resources", side_effect=error
+        ), mock.patch("activity_cog.logger.exception"):
+            await self.invoke(cog.activity_status, cog, interaction)
+
+        self.assertEqual(interaction.response.sent, [])
+        self.assertEqual(len(interaction.followup.sent), 1)
+        content, kwargs = interaction.followup.sent[0]
+        self.assertIn("처리하지 못했습니다", content)
+        self.assertTrue(kwargs["ephemeral"])
+
+    async def test_status_invalidates_missing_role_with_config_invalid_run(self):
+        cog, guild = await self.make_cog()
+        await self.set_complete_config(cog, guild)
+        await cog.reconcile_member(guild.members[0], 100)
+        guild.roles = []
+        interaction = fake_interaction(1, True, guild)
+
+        await self.invoke(cog.activity_status, cog, interaction, now=200)
+
+        content, kwargs = interaction.response.sent[0]
+        self.assertTrue(kwargs["ephemeral"])
+        self.assertIn("대상 역할을 찾을 수 없습니다", content)
+        self.assertIsNone(
+            (await cog._store_call(cog.store.get_config, 1)).target_role_id
+        )
+        self.assertEqual(
+            await cog._store_call(cog.store.list_sessions, 1, 1),
+            [("reading_room", 100, 200, "config_changed")],
+        )
+        self.assertEqual(
+            await cog._store_call(cog.store.list_runs, 1),
+            [(1, 1, 200, "config_invalid")],
+        )
+
+    async def test_status_invalidates_wrong_category_and_sod_channel_types(self):
+        cog, guild = await self.make_cog()
+        await self.set_complete_config(cog, guild)
+        guild.channels = [
+            fake_text_channel(20, guild),
+            guild.channels[1],
+            fake_category(40, guild),
+        ]
+        interaction = fake_interaction(1, True, guild)
+
+        await self.invoke(cog.activity_status, cog, interaction, now=210)
+
+        content = interaction.response.sent[0][0]
+        self.assertIn("독서실 카테고리를 찾을 수 없습니다", content)
+        self.assertIn("SoD/EoD 텍스트 채널을 찾을 수 없습니다", content)
+        config = await cog._store_call(cog.store.get_config, 1)
+        self.assertIsNone(config.reading_category_id)
+        self.assertIsNone(config.sod_eod_channel_id)
+        with closing(sqlite3.connect(cog.store.db_path)) as conn:
+            period = conn.execute(
+                "SELECT ended_epoch, ended_reason FROM sod_eod_channel_periods"
+            ).fetchone()
+        self.assertEqual(period, (210, "config_invalid"))
+
+    async def test_status_tolerates_null_settings_and_exposes_only_operational_data(self):
+        cog, guild = await self.make_cog()
+        interaction = fake_interaction(1, True, guild)
+
+        await self.invoke(cog.activity_status, cog, interaction, now=220)
+
+        content, kwargs = interaction.response.sent[0]
+        self.assertTrue(kwargs["ephemeral"])
+        self.assertIn("대상 역할 ID: 미설정", content)
+        self.assertIn("독서실 카테고리 ID: 미설정", content)
+        self.assertIn("스터디 카테고리 ID: 미설정", content)
+        self.assertIn("SoD/EoD 채널 ID: 미설정", content)
+        self.assertIn("열린 음성 세션: 0", content)
+        self.assertIn("열린 수집 run: 0", content)
+        self.assertNotIn("Secret Name", content)
+        self.assertNotIn("user_id", content)

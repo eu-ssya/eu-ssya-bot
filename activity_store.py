@@ -835,6 +835,91 @@ class ActivityStore:
                 raise
         return new
 
+    def invalidate_voice_config(
+        self,
+        guild_id: int,
+        *,
+        field: str,
+        effective_at_epoch: int,
+    ) -> ActivityConfig:
+        _require_integer_epochs(effective_at_epoch=effective_at_epoch)
+        if field not in {
+            "target_role_id",
+            "reading_category_id",
+            "study_category_id",
+        }:
+            raise ValueError("알 수 없는 음성 설정 필드입니다.")
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                old = self._get_config_in_tx(conn, guild_id)
+                if getattr(old, field) is None:
+                    conn.commit()
+                    return old
+                new = dataclasses.replace(old, **{field: None})
+                conn.execute(
+                    """
+                    UPDATE voice_sessions
+                    SET ended_epoch=?, closed_reason='config_changed'
+                    WHERE guild_id=? AND ended_epoch IS NULL
+                    """,
+                    (effective_at_epoch, guild_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE voice_collection_runs
+                    SET ended_epoch=?, ended_reason='config_invalid'
+                    WHERE guild_id=? AND ended_epoch IS NULL
+                    """,
+                    (effective_at_epoch, guild_id),
+                )
+                self._upsert_config_in_tx(conn, new, effective_at_epoch)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return new
+
+    def count_open_sessions(self, guild_id: int) -> int:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM voice_sessions
+                WHERE guild_id=? AND ended_epoch IS NULL
+                """,
+                (guild_id,),
+            ).fetchone()
+        return int(row[0])
+
+    def abort_full_reconcile(
+        self, guild_id: int, *, effective_at_epoch: int
+    ) -> None:
+        _require_integer_epochs(effective_at_epoch=effective_at_epoch)
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    """
+                    UPDATE voice_sessions
+                    SET ended_epoch=?, closed_reason='config_changed'
+                    WHERE guild_id=? AND ended_epoch IS NULL
+                    """,
+                    (effective_at_epoch, guild_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE voice_collection_runs
+                    SET ended_epoch=?, ended_reason='config_invalid'
+                    WHERE guild_id=? AND ended_epoch IS NULL
+                    """,
+                    (effective_at_epoch, guild_id),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
     def record_live_message(
         self,
         *,
