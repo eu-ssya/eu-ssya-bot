@@ -122,9 +122,14 @@ class ActivityCog(commands.Cog):
         )
 
     async def full_reconcile_guild(self, guild, effective_at_epoch: int) -> None:
-        """Reconcile one guild while the caller holds its guild lock."""
-        if not self.guild_locks[guild.id].locked():
-            raise RuntimeError("full_reconcile_guild requires the guild lock")
+        """Serialize and fully reconcile one guild."""
+        async with self.guild_locks[guild.id]:
+            await self._full_reconcile_guild_locked(guild, effective_at_epoch)
+
+    async def _full_reconcile_guild_locked(
+        self, guild, effective_at_epoch: int
+    ) -> None:
+        """Fully reconcile while the caller owns this guild's lock."""
         config = await self._store_call(self.store.get_config, guild.id)
         role = (
             None
@@ -200,7 +205,7 @@ class ActivityCog(commands.Cog):
                 and not self.collection_gates[guild.id].is_set()
             )
             if before_core != after_core or needs_recovery:
-                await self.full_reconcile_guild(guild, now_epoch)
+                await self._full_reconcile_guild_locked(guild, now_epoch)
 
     async def _change_sod_setting(
         self, guild, now_epoch: int, channel_id: int

@@ -514,8 +514,7 @@ class SettingsCommandTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(
             cog.store, "open_collection_run", side_effect=error
         ), self.assertRaises(sqlite3.Error) as raised:
-            async with cog.guild_locks[guild.id]:
-                await cog.full_reconcile_guild(guild, 101)
+            await cog.full_reconcile_guild(guild, 101)
 
         self.assertIs(raised.exception, error)
         self.assertFalse(cog.collection_gates[guild.id].is_set())
@@ -544,8 +543,7 @@ class SettingsCommandTests(unittest.IsolatedAsyncioTestCase):
 
         with mock.patch.object(cog, "reconcile_member", side_effect=fail_after_first):
             with self.assertRaises(sqlite3.Error):
-                async with cog.guild_locks[guild.id]:
-                    await cog.full_reconcile_guild(guild, 101)
+                await cog.full_reconcile_guild(guild, 101)
 
         self.assertFalse(cog.collection_gates[guild.id].is_set())
         self.assertEqual(
@@ -739,7 +737,7 @@ class SettingsCommandTests(unittest.IsolatedAsyncioTestCase):
             ).fetchone()
         self.assertEqual(period, (210, "config_invalid"))
 
-    async def test_full_reconcile_requires_lock_and_accessible_categories(self):
+    async def test_public_full_reconcile_rejects_inaccessible_categories(self):
         cog, guild = await self.make_cog()
         await cog._store_call(
             cog.store.apply_config_change,
@@ -750,20 +748,71 @@ class SettingsCommandTests(unittest.IsolatedAsyncioTestCase):
             effective_at_epoch=1,
         )
 
-        with self.assertRaisesRegex(RuntimeError, "guild lock"):
-            await cog.full_reconcile_guild(guild, 100)
-
         guild.channels[1].permissions_for.return_value = mock.Mock(
             view_channel=False
         )
-        async with cog.guild_locks[guild.id]:
-            await cog.full_reconcile_guild(guild, 100)
+        await cog.full_reconcile_guild(guild, 100)
 
         self.assertFalse(cog.collection_gates[guild.id].is_set())
         self.assertEqual(await cog._store_call(cog.store.list_runs, guild.id), [])
         self.assertEqual(
             await cog._store_call(cog.store.count_open_sessions, guild.id), 0
         )
+
+    async def test_public_full_reconcile_waits_for_other_task_holding_guild_lock(self):
+        cog, guild = await self.make_cog()
+        await cog._store_call(
+            cog.store.apply_config_change,
+            guild.id,
+            target_role_id=10,
+            reading_category_id=20,
+            study_category_id=30,
+            effective_at_epoch=1,
+        )
+        holder_entered = asyncio.Event()
+        release_holder = asyncio.Event()
+        caller_started = asyncio.Event()
+        reconcile_entered = asyncio.Event()
+        store_entered = asyncio.Event()
+        original_reconcile = cog._full_reconcile_guild_locked
+        original_store_call = cog._store_call
+
+        async def hold_lock():
+            async with cog.guild_locks[guild.id]:
+                holder_entered.set()
+                await release_holder.wait()
+
+        async def record_store_call(method, *args, **kwargs):
+            store_entered.set()
+            return await original_store_call(method, *args, **kwargs)
+
+        async def record_reconcile(*args, **kwargs):
+            reconcile_entered.set()
+            return await original_reconcile(*args, **kwargs)
+
+        async def call_public_reconcile():
+            caller_started.set()
+            await cog.full_reconcile_guild(guild, 100)
+
+        holder = asyncio.create_task(hold_lock())
+        await holder_entered.wait()
+        with mock.patch.object(
+            cog, "_full_reconcile_guild_locked", side_effect=record_reconcile
+        ), mock.patch.object(cog, "_store_call", side_effect=record_store_call):
+            caller = asyncio.create_task(call_public_reconcile())
+            await caller_started.wait()
+            was_blocked = (
+                not reconcile_entered.is_set()
+                and not store_entered.is_set()
+                and not caller.done()
+            )
+            release_holder.set()
+            await asyncio.gather(holder, caller)
+
+        self.assertTrue(was_blocked)
+        self.assertTrue(reconcile_entered.is_set())
+        self.assertTrue(store_entered.is_set())
+        self.assertTrue(cog.collection_gates[guild.id].is_set())
 
     async def test_long_status_is_bounded_and_preserves_detail_in_utf8_attachment(self):
         cog, guild = await self.make_cog()
