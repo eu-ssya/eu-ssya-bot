@@ -52,6 +52,21 @@ class CoverageSummary:
     gaps: list[tuple[int, int]]
 
 
+@dataclass(frozen=True)
+class ActivitySyncState:
+    guild_id: int
+    channel_id: int
+    newest_processed_message_id: int | None
+    newest_processed_message_created_epoch: int | None
+    history_from_epoch: int | None
+    completed_epoch: int | None
+    updated_epoch: int
+
+
+class ChannelChanged(RuntimeError):
+    pass
+
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS activity_config (guild_id INTEGER PRIMARY KEY,target_role_id INTEGER,reading_category_id INTEGER,study_category_id INTEGER,sod_eod_channel_id INTEGER,voice_collection_started_epoch INTEGER,created_epoch INTEGER NOT NULL,updated_epoch INTEGER NOT NULL,CHECK(reading_category_id IS NULL OR study_category_id IS NULL OR reading_category_id <> study_category_id));
 CREATE TABLE IF NOT EXISTS voice_sessions (id INTEGER PRIMARY KEY,guild_id INTEGER NOT NULL,user_id INTEGER NOT NULL,activity_kind TEXT NOT NULL CHECK(activity_kind IN ('reading_room','study')),started_epoch INTEGER NOT NULL,last_checkpoint_epoch INTEGER NOT NULL,ended_epoch INTEGER,closed_reason TEXT CHECK(closed_reason IN ('normal','category_change','role_removed','config_changed','reconciled','gateway_disconnect','restart_checkpoint')),CHECK(typeof(started_epoch)='integer'),CHECK(typeof(last_checkpoint_epoch)='integer'),CHECK(ended_epoch IS NULL OR typeof(ended_epoch)='integer'),CHECK(last_checkpoint_epoch >= started_epoch),CHECK((ended_epoch IS NULL AND closed_reason IS NULL) OR (ended_epoch IS NOT NULL AND closed_reason IS NOT NULL)),CHECK(ended_epoch IS NULL OR ended_epoch >= last_checkpoint_epoch));
@@ -478,6 +493,175 @@ class ActivityStore:
                 raise
         return new
 
+    def record_live_message(
+        self,
+        *,
+        guild_id: int,
+        channel_id: int,
+        message_id: int,
+        user_id: int,
+        message_created_epoch: int,
+        event_types: set[str],
+        updated_epoch: int,
+        expected_current_channel_id: int,
+    ) -> None:
+        _require_integer_epochs(
+            message_created_epoch=message_created_epoch,
+            updated_epoch=updated_epoch,
+        )
+        kinds = self._validated_event_types(event_types)
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._assert_current_channel_in_tx(
+                    conn,
+                    guild_id,
+                    channel_id,
+                    expected_current_channel_id,
+                )
+                self._insert_event_and_daily_in_tx(
+                    conn,
+                    guild_id,
+                    channel_id,
+                    message_id,
+                    user_id,
+                    message_created_epoch,
+                    kinds,
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def record_backfill_message_and_advance_cursor(
+        self,
+        *,
+        guild_id: int,
+        channel_id: int,
+        message_id: int,
+        user_id: int,
+        message_created_epoch: int,
+        event_types: set[str],
+        newest_processed_message_created_epoch: int,
+        updated_epoch: int,
+        expected_current_channel_id: int,
+    ) -> None:
+        _require_integer_epochs(
+            message_created_epoch=message_created_epoch,
+            newest_processed_message_created_epoch=(
+                newest_processed_message_created_epoch
+            ),
+            updated_epoch=updated_epoch,
+        )
+        kinds = self._validated_event_types(event_types)
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._assert_current_channel_in_tx(
+                    conn,
+                    guild_id,
+                    channel_id,
+                    expected_current_channel_id,
+                )
+                self._insert_event_and_daily_in_tx(
+                    conn,
+                    guild_id,
+                    channel_id,
+                    message_id,
+                    user_id,
+                    message_created_epoch,
+                    kinds,
+                )
+                self._advance_cursor_in_tx(
+                    conn,
+                    guild_id,
+                    channel_id,
+                    message_id,
+                    newest_processed_message_created_epoch,
+                    message_created_epoch,
+                    updated_epoch,
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def get_sync_state(
+        self, guild_id: int, channel_id: int
+    ) -> ActivitySyncState | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT guild_id, channel_id, newest_processed_message_id,
+                       newest_processed_message_created_epoch, history_from_epoch,
+                       completed_epoch, updated_epoch
+                FROM activity_sync_state
+                WHERE guild_id=? AND channel_id=?
+                """,
+                (guild_id, channel_id),
+            ).fetchone()
+        return None if row is None else ActivitySyncState(*row)
+
+    def mark_backfill_started(
+        self, guild_id: int, channel_id: int, updated_epoch: int
+    ) -> None:
+        _require_integer_epochs(updated_epoch=updated_epoch)
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO activity_sync_state(
+                        guild_id, channel_id, completed_epoch, updated_epoch
+                    ) VALUES (?, ?, NULL, ?)
+                    ON CONFLICT(guild_id, channel_id) DO UPDATE SET
+                        completed_epoch=NULL,
+                        updated_epoch=excluded.updated_epoch
+                    """,
+                    (guild_id, channel_id, updated_epoch),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def mark_backfill_completed(
+        self, guild_id: int, channel_id: int, completed_epoch: int
+    ) -> None:
+        _require_integer_epochs(completed_epoch=completed_epoch)
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO activity_sync_state(
+                        guild_id, channel_id, completed_epoch, updated_epoch
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(guild_id, channel_id) DO UPDATE SET
+                        completed_epoch=excluded.completed_epoch,
+                        updated_epoch=excluded.updated_epoch
+                    """,
+                    (guild_id, channel_id, completed_epoch, completed_epoch),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def daily_types(
+        self, guild_id: int, user_id: int, event_date_kst: str
+    ) -> set[str]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT event_type
+                FROM sod_eod_daily
+                WHERE guild_id=? AND user_id=? AND event_date_kst=?
+                """,
+                (guild_id, user_id, event_date_kst),
+            )
+            return {row[0] for row in rows}
+
     @staticmethod
     def _replace_unset(
         old: ActivityConfig,
@@ -582,6 +766,111 @@ class ActivityStore:
             ) VALUES (?, ?, ?, ?, ?)
             """,
             (guild_id, user_id, activity_kind, started_epoch, started_epoch),
+        )
+
+    @staticmethod
+    def _validated_event_types(event_types: set[str]) -> frozenset[str]:
+        kinds = frozenset(event_types)
+        if not kinds.issubset({"sod", "eod"}):
+            raise ValueError("알 수 없는 SoD/EoD 유형입니다.")
+        return kinds
+
+    @staticmethod
+    def _assert_current_channel_in_tx(
+        conn: sqlite3.Connection,
+        guild_id: int,
+        channel_id: int,
+        expected_current_channel_id: int,
+    ) -> None:
+        row = conn.execute(
+            "SELECT sod_eod_channel_id FROM activity_config WHERE guild_id=?",
+            (guild_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row[0] != expected_current_channel_id
+            or channel_id != expected_current_channel_id
+        ):
+            raise ChannelChanged(channel_id)
+
+    @staticmethod
+    def _insert_event_and_daily_in_tx(
+        conn: sqlite3.Connection,
+        guild_id: int,
+        channel_id: int,
+        message_id: int,
+        user_id: int,
+        message_created_epoch: int,
+        event_types: frozenset[str],
+    ) -> None:
+        event_date_kst = kst_day_for_epoch(message_created_epoch)
+        for event_type in sorted(event_types):
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO sod_eod_events(
+                    message_id, guild_id, user_id, event_date_kst, event_type,
+                    message_created_epoch, channel_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message_id,
+                    guild_id,
+                    user_id,
+                    event_date_kst,
+                    event_type,
+                    message_created_epoch,
+                    channel_id,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO sod_eod_daily(
+                    guild_id, user_id, event_date_kst, event_type
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (guild_id, user_id, event_date_kst, event_type),
+            )
+
+    @staticmethod
+    def _advance_cursor_in_tx(
+        conn: sqlite3.Connection,
+        guild_id: int,
+        channel_id: int,
+        message_id: int,
+        newest_processed_message_created_epoch: int,
+        message_created_epoch: int,
+        updated_epoch: int,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO activity_sync_state(
+                guild_id, channel_id, newest_processed_message_id,
+                newest_processed_message_created_epoch, history_from_epoch,
+                updated_epoch
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id, channel_id) DO UPDATE SET
+                newest_processed_message_id=excluded.newest_processed_message_id,
+                newest_processed_message_created_epoch=(
+                    excluded.newest_processed_message_created_epoch
+                ),
+                history_from_epoch=CASE
+                    WHEN activity_sync_state.history_from_epoch IS NULL
+                    THEN excluded.history_from_epoch
+                    ELSE MIN(
+                        activity_sync_state.history_from_epoch,
+                        excluded.history_from_epoch
+                    )
+                END,
+                updated_epoch=excluded.updated_epoch
+            """,
+            (
+                guild_id,
+                channel_id,
+                message_id,
+                newest_processed_message_created_epoch,
+                message_created_epoch,
+                updated_epoch,
+            ),
         )
 
     @staticmethod

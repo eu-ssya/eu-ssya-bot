@@ -1,3 +1,4 @@
+import activity_store
 import sqlite3
 import tempfile
 import unittest
@@ -490,3 +491,235 @@ class VoiceSessionTests(unittest.TestCase):
 
         self.assertEqual(self.store.list_sessions(1, 2)[0][3], "reconciled")
         self.assertEqual(self.store.list_runs(1)[0][3], "graceful_shutdown")
+
+
+class SodEodStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = ActivityStore(str(Path(self.tmp.name) / "activity.db"))
+        self.store.initialize()
+        self.store.apply_config_change(
+            1, sod_eod_channel_id=2, effective_at_epoch=99
+        )
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _event_count(self):
+        with closing(self.store._connect()) as conn:
+            return conn.execute("SELECT COUNT(*) FROM sod_eod_events").fetchone()[0]
+
+    def test_event_daily_cursor_are_atomic_and_types_are_validated(self):
+        with self.assertRaises(ValueError):
+            self.store.record_backfill_message_and_advance_cursor(
+                guild_id=1,
+                channel_id=2,
+                message_id=3,
+                user_id=4,
+                message_created_epoch=100,
+                event_types={"bad"},
+                newest_processed_message_created_epoch=100,
+                updated_epoch=101,
+                expected_current_channel_id=2,
+            )
+
+        self.assertIsNone(
+            self.store.get_sync_state(1, 2).newest_processed_message_id
+        )
+        with closing(self.store._connect()) as conn:
+            conn.execute(
+                """
+                CREATE TRIGGER fail_daily BEFORE INSERT ON sod_eod_daily
+                BEGIN SELECT RAISE(ABORT, 'daily failed'); END
+                """
+            )
+            conn.commit()
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.record_backfill_message_and_advance_cursor(
+                guild_id=1,
+                channel_id=2,
+                message_id=3,
+                user_id=4,
+                message_created_epoch=100,
+                event_types={"sod"},
+                newest_processed_message_created_epoch=100,
+                updated_epoch=101,
+                expected_current_channel_id=2,
+            )
+
+        self.assertEqual(self._event_count(), 0)
+        self.assertEqual(self.store.daily_types(1, 4, "1970-01-01"), set())
+        self.assertIsNone(
+            self.store.get_sync_state(1, 2).newest_processed_message_id
+        )
+        with closing(self.store._connect()) as conn:
+            conn.execute("DROP TRIGGER fail_daily")
+            conn.commit()
+
+        self.store.record_backfill_message_and_advance_cursor(
+            guild_id=1,
+            channel_id=2,
+            message_id=3,
+            user_id=4,
+            message_created_epoch=100,
+            event_types={"sod", "eod"},
+            newest_processed_message_created_epoch=100,
+            updated_epoch=101,
+            expected_current_channel_id=2,
+        )
+
+        self.assertEqual(
+            self.store.daily_types(1, 4, "1970-01-01"), {"sod", "eod"}
+        )
+        self.assertEqual(self._event_count(), 2)
+
+    def test_live_both_types_dedupe_daily_without_advancing_backfill_marker(self):
+        for message_id in (10, 11):
+            self.store.record_live_message(
+                guild_id=1,
+                channel_id=2,
+                message_id=message_id,
+                user_id=4,
+                message_created_epoch=100,
+                event_types={"sod", "eod"},
+                updated_epoch=101,
+                expected_current_channel_id=2,
+            )
+
+        state = self.store.get_sync_state(1, 2)
+        self.assertIsNone(state.newest_processed_message_id)
+        self.assertIsNone(state.history_from_epoch)
+        self.assertEqual(
+            self.store.daily_types(1, 4, "1970-01-01"), {"sod", "eod"}
+        )
+        self.assertEqual(self._event_count(), 4)
+
+    def test_partial_resume_and_delta_scans_preserve_history_and_completion(self):
+        self.store.mark_backfill_started(1, 2, 100)
+        self.store.record_backfill_message_and_advance_cursor(
+            guild_id=1,
+            channel_id=2,
+            message_id=20,
+            user_id=4,
+            message_created_epoch=50,
+            event_types=set(),
+            newest_processed_message_created_epoch=50,
+            updated_epoch=101,
+            expected_current_channel_id=2,
+        )
+        partial = self.store.get_sync_state(1, 2)
+        self.assertEqual(partial.newest_processed_message_id, 20)
+        self.assertEqual(partial.history_from_epoch, 50)
+        self.assertIsNone(partial.completed_epoch)
+
+        self.store.mark_backfill_started(1, 2, 110)
+        self.store.record_backfill_message_and_advance_cursor(
+            guild_id=1,
+            channel_id=2,
+            message_id=21,
+            user_id=5,
+            message_created_epoch=60,
+            event_types=set(),
+            newest_processed_message_created_epoch=60,
+            updated_epoch=111,
+            expected_current_channel_id=2,
+        )
+        self.store.mark_backfill_completed(1, 2, 120)
+        resumed = self.store.get_sync_state(1, 2)
+        self.assertEqual(resumed.newest_processed_message_id, 21)
+        self.assertEqual(resumed.history_from_epoch, 50)
+        self.assertEqual(resumed.completed_epoch, 120)
+
+        self.store.mark_backfill_started(1, 2, 130)
+        started_delta = self.store.get_sync_state(1, 2)
+        self.assertIsNone(started_delta.completed_epoch)
+        self.store.record_backfill_message_and_advance_cursor(
+            guild_id=1,
+            channel_id=2,
+            message_id=22,
+            user_id=6,
+            message_created_epoch=140,
+            event_types=set(),
+            newest_processed_message_created_epoch=140,
+            updated_epoch=141,
+            expected_current_channel_id=2,
+        )
+        self.store.mark_backfill_completed(1, 2, 150)
+        delta = self.store.get_sync_state(1, 2)
+        self.assertEqual(delta.newest_processed_message_id, 22)
+        self.assertEqual(delta.history_from_epoch, 50)
+        self.assertEqual(delta.completed_epoch, 150)
+
+    def test_channel_change_rejects_live_and_backfill_with_zero_writes(self):
+        self.store.apply_config_change(
+            1, sod_eod_channel_id=3, effective_at_epoch=102
+        )
+
+        for operation in (
+            lambda: self.store.record_live_message(
+                guild_id=1,
+                channel_id=2,
+                message_id=30,
+                user_id=4,
+                message_created_epoch=100,
+                event_types={"sod"},
+                updated_epoch=103,
+                expected_current_channel_id=2,
+            ),
+            lambda: self.store.record_backfill_message_and_advance_cursor(
+                guild_id=1,
+                channel_id=2,
+                message_id=31,
+                user_id=4,
+                message_created_epoch=101,
+                event_types={"eod"},
+                newest_processed_message_created_epoch=101,
+                updated_epoch=103,
+                expected_current_channel_id=2,
+            ),
+        ):
+            with self.subTest(operation=operation):
+                with self.assertRaises(activity_store.ChannelChanged):
+                    operation()
+
+        self.assertEqual(self._event_count(), 0)
+        self.assertEqual(self.store.daily_types(1, 4, "1970-01-01"), set())
+        self.assertIsNone(
+            self.store.get_sync_state(1, 2).newest_processed_message_id
+        )
+
+    def test_event_and_sync_apis_reject_fractional_epochs(self):
+        operations = [
+            lambda: self.store.record_live_message(
+                guild_id=1,
+                channel_id=2,
+                message_id=40,
+                user_id=4,
+                message_created_epoch=100.5,
+                event_types={"sod"},
+                updated_epoch=101,
+                expected_current_channel_id=2,
+            ),
+            lambda: self.store.record_backfill_message_and_advance_cursor(
+                guild_id=1,
+                channel_id=2,
+                message_id=41,
+                user_id=4,
+                message_created_epoch=100,
+                event_types=set(),
+                newest_processed_message_created_epoch=100.5,
+                updated_epoch=101,
+                expected_current_channel_id=2,
+            ),
+            lambda: self.store.mark_backfill_started(1, 2, 100.5),
+            lambda: self.store.mark_backfill_completed(1, 2, 100.5),
+        ]
+
+        for operation in operations:
+            with self.subTest(operation=operation), self.assertRaises(TypeError):
+                operation()
+
+        self.assertEqual(self._event_count(), 0)
+        self.assertIsNone(
+            self.store.get_sync_state(1, 2).newest_processed_message_id
+        )
