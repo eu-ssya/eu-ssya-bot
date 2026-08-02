@@ -360,14 +360,23 @@ class ActivityCog(commands.Cog):
                     "reconciled",
                 )
         except Exception:
-            try:
-                await self._store_call(
-                    self.store.abort_full_reconcile,
-                    guild.id,
-                    effective_at_epoch=effective_at_epoch,
-                )
-            except Exception:
-                logger.exception("failed to abort activity full reconcile")
+            owns_generation = (
+                expected_generation is None
+                or self._collection_generations[guild.id] == expected_generation
+            )
+            if owns_generation:
+                try:
+                    await self._store_call(
+                        self.store.abort_full_reconcile,
+                        guild.id,
+                        effective_at_epoch=effective_at_epoch,
+                    )
+                except Exception:
+                    logger.exception("failed to abort activity full reconcile")
+            else:
+                # A newer lifecycle event owns cleanup at its own epoch.
+                # Keep the gate closed and never sweep from this stale attempt.
+                self.dirty_guilds.add(guild.id)
             raise
         if (
             expected_generation is not None
