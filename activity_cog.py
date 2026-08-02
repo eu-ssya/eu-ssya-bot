@@ -32,11 +32,22 @@ logger = logging.getLogger(__name__)
 SOD_EOD_PATTERN = re.compile(r"(?<![a-z0-9])(sod|eod)(?![a-z0-9])")
 AUTHOR_ELIGIBILITY_CACHE_LIMIT = 64
 REPORT_PAGE_SIZE = 15
-REPORT_CONTENT_LIMIT = 1900
+REPORT_CONTENT_LIMIT = 2000
 REPORT_VIEW_TIMEOUT_SECONDS = 600
 REPORT_WARNING_SUMMARY_LIMIT = 120
 TEXT_SYNC_RETRY_DELAY_SECONDS = 30.0
 _TEXT_RECOVERY_PREPARE_FAILED = object()
+
+_TABLE_COLUMNS = (
+    ("순위", 4, "right"),
+    ("이름", 14, "left"),
+    ("최근 활동", 16, "left"),
+    ("독서실", 16, "right"),
+    ("스터디", 16, "right"),
+    ("SoD", 3, "right"),
+    ("EoD", 3, "right"),
+    ("활동일", 6, "right"),
+)
 
 
 def detect_sod_eod(content: str) -> set[str]:
@@ -76,13 +87,6 @@ def _strict_iso_date(value: str) -> date:
         return date.fromisoformat(value)
     except ValueError as error:
         raise ValueError("날짜는 유효한 YYYY-MM-DD 형식이어야 합니다.") from error
-
-
-def _clean_display_name(value: str, limit: int) -> str:
-    cleaned = " ".join(str(value).split()) or "이름 없음"
-    if len(cleaned) <= limit:
-        return cleaned
-    return cleaned[: max(1, limit - 1)] + "…"
 
 
 def _is_zero_width_extension(character: str) -> bool:
@@ -227,49 +231,39 @@ def _format_timestamp(epoch: int | None, target_timezone) -> str:
         return f"UTC epoch {epoch}"
 
 
-def _base36(value: int) -> str:
-    alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
-    if value == 0:
-        return "0"
-    sign = "-" if value < 0 else ""
-    value = abs(value)
-    digits = []
-    while value:
-        value, remainder = divmod(value, 36)
-        digits.append(alphabet[remainder])
-    return sign + "".join(reversed(digits))
-
-
-def _page_identifier(value: int) -> str:
-    exact = str(value)
-    if len(exact) <= 8:
-        return exact
-    return "z" + _base36(value)
-
-
-def _page_number(value: int) -> str:
-    exact = str(value)
-    sign = "-" if exact.startswith("-") else ""
-    digits = exact.removeprefix("-")
-    if len(digits) <= 6:
-        return exact
-    return f"{sign}{digits[0]}e{len(digits) - 1}"
-
-
-def _page_timestamp(epoch: int | None) -> str:
-    if epoch is None:
-        return "없음"
-    try:
-        return datetime.fromtimestamp(epoch, KST).strftime("%y%m%dT%H%M")
-    except (OverflowError, OSError, ValueError):
-        return "e:" + _page_number(epoch)
-
-
 def _warning_summary_lines(
     report: ActivityReport,
     *,
-    character_limit: int = REPORT_WARNING_SUMMARY_LIMIT,
+    character_limit: int,
 ) -> list[str]:
+    if character_limit <= 0:
+        return []
+    if not report.warnings:
+        return ["경고: 없음"] if len("경고: 없음") <= character_limit else []
+    warning_count = len(report.warnings)
+    warning_kind_count = len({warning.code for warning in report.warnings})
+    lines = [f"경고: 총 {warning_count}건/{warning_kind_count}종"]
+    if len(lines[0]) > character_limit:
+        compact = f"경고: 총 {warning_count}건 · 상세는 전체 TXT 참조."
+        return [compact] if len(compact) <= character_limit else []
+    used = len(lines[0])
+    for index, warning in enumerate(report.warnings):
+        line = f"- {_humanize_warning(warning)}"
+        remaining = len(report.warnings) - index
+        omitted = f"- 나머지 {remaining}건 상세는 전체 TXT 참조."
+        reserve = 1 + len(omitted) if remaining else 0
+        if used + 1 + len(line) + reserve > character_limit:
+            if used + 1 + len(omitted) <= character_limit:
+                lines.append(omitted)
+                return lines
+            compact = f"경고: 총 {warning_count}건 · 상세는 전체 TXT 참조."
+            return [compact] if len(compact) <= character_limit else []
+        lines.append(line)
+        used += 1 + len(line)
+    return lines
+
+
+def _txt_warning_summary_lines(report: ActivityReport) -> list[str]:
     if not report.warnings:
         return ["경고: 없음"]
     warning_count = len(report.warnings)
@@ -282,7 +276,7 @@ def _warning_summary_lines(
         remaining = len(report.warnings) - index
         omitted = f"- 나머지 {remaining}건 상세는 전체 TXT 참조."
         reserve = 1 + len(omitted) if remaining else 0
-        if used + 1 + len(line) + reserve > character_limit:
+        if used + 1 + len(line) + reserve > REPORT_WARNING_SUMMARY_LIMIT:
             lines.append(omitted)
             break
         lines.append(line)
@@ -290,34 +284,36 @@ def _warning_summary_lines(
     return lines
 
 
-def _page_row_line(row: ReportRow, *, row_budget: int) -> str:
-    identifier = _page_identifier(row.user_id)
-    values = (
-        _page_timestamp(row.last_activity_epoch),
-        _page_number(row.reading_seconds),
-        _page_number(row.reading_session_count),
-        _page_number(row.study_seconds),
-        _page_number(row.study_session_count),
-        _page_number(row.sod_days),
-        _page_number(row.eod_days),
-        _page_number(row.combined_days),
+def _table_line(values: tuple[str, ...]) -> str:
+    return " ".join(
+        _fit_terminal_cell(value, width, align=align)
+        for value, (_label, width, align) in zip(values, _TABLE_COLUMNS)
     )
-    suffix = (
-        f"|최근={values[0]}"
-        f"|독서초={values[1]}"
-        f"|독서회={values[2]}"
-        f"|스터디초={values[3]}"
-        f"|스터디회={values[4]}"
-        f"|SoD={values[5]}"
-        f"|EoD={values[6]}"
-        f"|통합={values[7]}"
-    )
-    fixed_size = len(identifier) + len(suffix) + 3
-    name_limit = min(12, max(4, row_budget - fixed_size))
-    name = _clean_display_name(row.display_name, name_limit)
-    return (
-        f"[{identifier}] {name}{suffix}"
-    )
+
+
+def _report_table_lines(
+    rows: list[ReportRow],
+    *,
+    start_rank: int,
+) -> list[str]:
+    lines = [_table_line(tuple(label for label, _width, _align in _TABLE_COLUMNS))]
+    for offset, row in enumerate(rows):
+        name = " ".join(str(row.display_name).split()) or "이름 없음"
+        lines.append(
+            _table_line(
+                (
+                    str(start_rank + offset),
+                    name,
+                    _format_recent_activity(row.last_activity_epoch),
+                    _format_duration(row.reading_seconds),
+                    _format_duration(row.study_seconds),
+                    str(row.sod_days),
+                    str(row.eod_days),
+                    str(row.combined_days),
+                )
+            )
+        )
+    return lines
 
 
 def format_report_page(report: ActivityReport, page_index: int) -> str:
@@ -325,26 +321,27 @@ def format_report_page(report: ActivityReport, page_index: int) -> str:
     page_index = min(max(0, page_index), page_count - 1)
     start = page_index * REPORT_PAGE_SIZE
     rows = report.rows[start : start + REPORT_PAGE_SIZE]
-    warning_lines = _warning_summary_lines(report)
-    header = [
-        "활동 현황 보고서",
-        _clean_display_name(report.period_label, 45),
+    table_lines = _report_table_lines(rows, start_rank=start + 1)
+    if not rows:
+        table_lines.append("표시할 대상 멤버가 없습니다.")
+
+    fixed_lines = [
         (
-            f"생성={_page_timestamp(report.generated_epoch)}"
-            f"|페이지={_page_number(page_index + 1)}/{_page_number(page_count)}"
+            f"활동 현황 · {report.start_date} ~ {report.end_date} "
+            f"· {page_index + 1}/{page_count}"
         ),
+        "정렬: 활동일 ↓ · 음성시간 ↓ · 최근활동 ↓",
+        "```text",
+        *table_lines,
+        "```",
     ]
-    if rows:
-        fixed_content_length = len("\n".join(header + warning_lines))
-        row_budget = (
-            REPORT_CONTENT_LIMIT
-            - fixed_content_length
-            - len(rows)
-        ) // len(rows)
-        body = [_page_row_line(row, row_budget=row_budget) for row in rows]
-    else:
-        body = ["표시할 대상 멤버가 없습니다."]
-    content = "\n".join(header + body + warning_lines)
+    fixed_content = "\n".join(fixed_lines)
+    warning_budget = REPORT_CONTENT_LIMIT - len(fixed_content) - 1
+    warning_lines = _warning_summary_lines(
+        report,
+        character_limit=min(REPORT_WARNING_SUMMARY_LIMIT, warning_budget),
+    )
+    content = "\n".join([*fixed_lines, *warning_lines])
     if len(content) > REPORT_CONTENT_LIMIT:
         raise ValueError("activity report page budget exceeded")
     return content
@@ -360,7 +357,7 @@ def build_report_txt(report: ActivityReport) -> str:
         f"생성 UTC: {generated_utc}",
         f"생성 KST: {generated_kst}",
         "",
-        *_warning_summary_lines(report),
+        *_txt_warning_summary_lines(report),
     ]
     if report.warnings:
         lines.extend(

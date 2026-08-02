@@ -3730,7 +3730,7 @@ class ActivityReportViewTests(unittest.IsolatedAsyncioTestCase):
             original,
         )
 
-    def test_exact_page_counts_and_all_rows_are_reachable(self):
+    def test_exact_page_counts_and_global_ranks_are_reachable(self):
         from activity_cog import format_report_page
 
         for count, expected_pages in ((1, 1), (15, 1), (16, 2), (55, 4)):
@@ -3738,11 +3738,13 @@ class ActivityReportViewTests(unittest.IsolatedAsyncioTestCase):
                 report = report_with_members(count)
                 self.assertEqual(report.page_count, expected_pages)
                 pages = [format_report_page(report, page) for page in range(expected_pages)]
-                for member_id in range(count):
-                    self.assertTrue(
-                        any(f"[{member_id}]" in page for page in pages),
-                        f"member {member_id} was not reachable",
-                    )
+                rendered_rows = []
+                for page in pages:
+                    table = page.split("```text\n", 1)[1].split("\n```", 1)[0]
+                    rendered_rows.extend(table.splitlines()[1:])
+                self.assertEqual(len(rendered_rows), count)
+                self.assertTrue(rendered_rows[0].startswith("   1 "))
+                self.assertTrue(rendered_rows[-1].startswith(f"{count:>4} "))
 
     async def test_three_argument_constructor_binds_first_authorized_guild(self):
         from activity_cog import ActivityReportView
@@ -3779,70 +3781,125 @@ class ActivityReportViewTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(view.previous_page.disabled)
         self.assertFalse(view.next_page.disabled)
 
-    def test_empty_page_and_long_unicode_names_stay_below_content_limit(self):
+    def test_page_renders_readable_fixed_width_table_without_ids_or_session_counts(self):
         from activity_cog import format_report_page
 
-        empty = format_report_page(make_report([]), 999)
-        self.assertIn("표시할 대상 멤버가 없습니다", empty)
-
-        long_name = "👩🏽‍💻한글𠮷" * 300
-        report = make_report(
-            [self.row(index, display_name=long_name) for index in range(1, 16)]
+        recent_epoch = int(
+            datetime.datetime(2026, 8, 3, 23, 24, tzinfo=KST).timestamp()
         )
-        page = format_report_page(report, 0)
-        self.assertLessEqual(len(page), 1900)
-        page.encode("utf-8")
-        self.assertIn("[1]", page)
-        self.assertIn("[15]", page)
+        row = ReportRow(
+            user_id=987654321012345678,
+            display_name="한정수",
+            last_activity_epoch=recent_epoch,
+            reading_seconds=12 * 3600 + 30 * 60 + 59,
+            study_seconds=20 * 60 + 35,
+            reading_session_count=99,
+            study_session_count=88,
+            sod_days=28,
+            eod_days=21,
+            combined_days=29,
+        )
 
-    def test_worst_case_page_keeps_every_row_and_field_complete(self):
-        from activity_cog import format_report_page
+        page = format_report_page(make_report([row]), 0)
 
-        huge = 10**250
+        self.assertIn(
+            "순위 이름           최근 활동                  독서실           스터디 SoD EoD 활동일",
+            page,
+        )
+        self.assertIn("2026-08-03 23:24", page)
+        self.assertIn("12시간 30분", page)
+        self.assertIn("20분", page)
+        self.assertIn(" 28", page)
+        self.assertIn(" 21", page)
+        self.assertIn(" 29", page)
+        self.assertNotIn(str(row.user_id), page)
+        self.assertNotIn("독서초", page)
+        self.assertNotIn("독서회", page)
+        self.assertNotIn("스터디초", page)
+        self.assertNotIn("스터디회", page)
+
+    def test_table_header_and_data_share_fixed_width_column_boundaries(self):
+        from activity_cog import _report_table_lines, _terminal_cell_width
+
+        header, data = _report_table_lines([self.row()], start_rank=1)
+
+        self.assertEqual(
+            header,
+            "순위 이름           최근 활동                  독서실           스터디 SoD EoD 활동일",
+        )
+        self.assertEqual(_terminal_cell_width(header), 85)
+        self.assertEqual(_terminal_cell_width(data), 85)
+
+        header_tokens = (
+            "순위",
+            "이름",
+            "최근 활동",
+            "독서실",
+            "스터디",
+            "SoD",
+            "EoD",
+            "활동일",
+        )
+        self.assertEqual(
+            [
+                _terminal_cell_width(header[: header.index(token)])
+                for token in header_tokens
+            ],
+            [0, 5, 20, 47, 64, 71, 75, 79],
+        )
+        data_tokens = (
+            "1",
+            "Member",
+            "1970-01-01 09:01",
+            "1분",
+            "2분",
+            "4",
+            "5",
+            "6",
+        )
+        self.assertEqual(
+            [
+                _terminal_cell_width(data[: data.index(token)])
+                for token in data_tokens
+            ],
+            [3, 5, 20, 50, 67, 73, 77, 84],
+        )
+
+    def test_fifteen_long_unicode_rows_keep_table_and_shorten_warnings_under_2000(self):
+        from activity_cog import _terminal_cell_width, format_report_page
+
         rows = [
-            ReportRow(
-                user_id=index,
-                display_name=f"N{index:02d}-" + ("👩🏽‍💻한글𠮷" * 200),
-                last_activity_epoch=huge,
-                reading_seconds=huge,
-                study_seconds=huge - index,
-                reading_session_count=huge - 100,
-                study_session_count=huge - 200,
-                sod_days=huge - 300,
-                eod_days=huge - 400,
-                combined_days=huge - 500,
+            self.row(
+                index,
+                display_name=f"{index:02d}-" + ("👩🏽‍💻한글Alice" * 30),
+                last_activity_epoch=int(
+                    datetime.datetime(2026, 8, 3, 23, 24, tzinfo=KST).timestamp()
+                ),
             )
             for index in range(1, 16)
         ]
         warnings = [
             CoverageWarning(
-                code=f"warning_{index:02d}_" + ("x" * 100),
+                code=f"warning_{index:02d}",
                 text=f"경고 {index:02d} " + ("매우 긴 경고 내용 " * 100),
             )
             for index in range(30)
         ]
 
         page = format_report_page(make_report(rows, warnings=warnings), 0)
-        row_lines = [line for line in page.splitlines() if line.startswith("[")]
+        table = page.split("```text\n", 1)[1].split("\n```", 1)[0]
+        lines = table.splitlines()
 
-        self.assertLessEqual(len(page), 1900)
+        self.assertLessEqual(len(page), 2000)
         page.encode("utf-8")
-        self.assertEqual(len(row_lines), 15)
-        for index, line in enumerate(row_lines, 1):
-            self.assertIn(f"[{index}]", line)
-            self.assertIn(f"N{index:02d}", line)
-            for label in (
-                "최근=",
-                "독서초=",
-                "독서회=",
-                "스터디초=",
-                "스터디회=",
-                "SoD=",
-                "EoD=",
-                "통합=",
-            ):
-                self.assertIn(label, line)
-        self.assertIn("전체 TXT", page)
+        self.assertEqual(len(lines), 16)  # header + 15명
+        for rank, line in enumerate(lines[1:], 1):
+            self.assertTrue(line.startswith(f"{rank:>4} "))
+            # 순위 4칸 뒤 공백 다음의 이름 cell이 정확히 14 terminal cells다.
+            name_and_rest = line[5:]
+            name_cell = name_and_rest.split(" 2026-", 1)[0]
+            self.assertEqual(_terminal_cell_width(name_cell), 14)
+            self.assertIn("...", name_cell)
 
     def test_page_and_txt_share_warning_text(self):
         from activity_cog import build_report_txt, format_report_page
