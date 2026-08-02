@@ -24,7 +24,9 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 DATA_FILE = os.getenv("DATA_FILE", "rss_data.json")
 
 intents = discord.Intents.default()
-# Slash 명령어만 사용하므로 message_content 권한은 불필요.
+intents.members = True
+intents.message_content = True
+intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -318,10 +320,18 @@ async def _before_rss_loop():
     logger.info("RSS loop ready")
 
 
+async def _load_extensions(bot_instance, rss_start):
+    try:
+        await bot_instance.load_extension("activity_cog")
+    except Exception:
+        logger.exception("activity extension unavailable; RSS and wallet continue")
+    await bot_instance.load_extension("wallet_cog")
+    rss_start()
+
+
 @bot.event
 async def setup_hook():
-    await bot.load_extension("wallet_cog")
-    rss_loop.start()
+    await _load_extensions(bot, rss_loop.start)
 
 
 # ---------------- 엔트리 포인트 ----------------
