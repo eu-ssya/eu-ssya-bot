@@ -44,6 +44,26 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(end - start, 86400)
         self.assertEqual(kst_day_for_epoch(start), "2026-08-02")
 
+    def test_latest_activity_group_query_has_guild_user_epoch_covering_access(self):
+        self.store.initialize()
+        with closing(self.store._connect()) as conn:
+            details = " ".join(
+                row[3]
+                for row in conn.execute(
+                    """
+                    EXPLAIN QUERY PLAN
+                    SELECT user_id, MAX(message_created_epoch)
+                    FROM sod_eod_events
+                    WHERE guild_id=? AND user_id IN (?, ?)
+                    GROUP BY user_id
+                    """,
+                    (1, 2, 3),
+                )
+            )
+
+        self.assertIn("COVERING INDEX", details)
+        self.assertIn("guild_id=? AND user_id=?", details)
+
 
 class ConfigurationTests(unittest.TestCase):
     def setUp(self):
@@ -1110,7 +1130,7 @@ class ReportStoreTests(unittest.TestCase):
         self.assertIn(
             (
                 "sod_history_unavailable",
-                "조회 구간 100~300 UTC epoch에 SoD/EoD 채널 이력 시작점을 확인할 수 없습니다.",
+                "조회 구간 100~300 UTC epoch에 SoD/EoD 채널 이력 시작점을 확인할 수 없습니다. 이 조회의 값은 부분 데이터입니다.",
             ),
             warning_pairs,
         )
@@ -1128,3 +1148,108 @@ class ReportStoreTests(unittest.TestCase):
             arguments[field] = 100.5
             with self.subTest(field=field), self.assertRaises(TypeError):
                 self.store.build_report(**arguments)
+
+    def test_casefold_equal_names_use_user_id_as_stable_tie_breaker(self):
+        report = self.store.build_report(
+            guild_id=1,
+            members=[
+                activity_store.ReportMember(9, "alpha"),
+                activity_store.ReportMember(2, "Alpha"),
+                activity_store.ReportMember(5, "Beta"),
+            ],
+            start_epoch=0,
+            end_epoch=200,
+            as_of_epoch=200,
+        )
+
+        self.assertEqual([row.user_id for row in report.rows], [2, 9, 5])
+
+    def test_every_coverage_warning_explicitly_identifies_partial_data(self):
+        report = self.store.build_report(
+            guild_id=1,
+            members=[],
+            start_epoch=100,
+            end_epoch=300,
+            as_of_epoch=300,
+        )
+
+        self.assertGreater(len(report.warnings), 0)
+        self.assertTrue(
+            all("부분 데이터" in warning.text for warning in report.warnings)
+        )
+        self.assertFalse(any("추정" in warning.text for warning in report.warnings))
+
+    def test_latest_exact_activity_wins_across_message_and_session_sources(self):
+        self.store.apply_config_change(
+            1, sod_eod_channel_id=10, effective_at_epoch=0
+        )
+        self.store.reconcile_session(1, 3, "study", 100)
+        self.store.reconcile_session(1, 3, None, 200, close_reason="normal")
+        self.store.reconcile_session(1, 4, "study", 300)
+        self.store.reconcile_session(1, 4, None, 400, close_reason="normal")
+        for message_id, user_id, created_epoch in ((1, 3, 300), (2, 4, 250)):
+            self.store.record_live_message(
+                guild_id=1,
+                channel_id=10,
+                message_id=message_id,
+                user_id=user_id,
+                message_created_epoch=created_epoch,
+                event_types={"sod"},
+                updated_epoch=created_epoch,
+                expected_current_channel_id=10,
+            )
+
+        report = self.store.build_report(
+            guild_id=1,
+            members=[
+                activity_store.ReportMember(4, "Session Later"),
+                activity_store.ReportMember(3, "Message Later"),
+            ],
+            start_epoch=0,
+            end_epoch=100,
+            as_of_epoch=500,
+        )
+
+        self.assertEqual(
+            {row.user_id: row.last_activity_epoch for row in report.rows},
+            {3: 300, 4: 400},
+        )
+
+    def test_report_select_count_is_bounded_as_member_count_grows(self):
+        def select_count(members):
+            statements = []
+            original_connect = self.store._connect
+
+            def traced_connect():
+                conn = original_connect()
+                conn.set_trace_callback(
+                    lambda statement: statements.append(statement)
+                    if statement.lstrip().upper().startswith("SELECT")
+                    else None
+                )
+                return conn
+
+            with mock.patch.object(
+                self.store, "_connect", side_effect=traced_connect
+            ):
+                self.store.build_report(
+                    guild_id=1,
+                    members=members,
+                    start_epoch=0,
+                    end_epoch=200,
+                    as_of_epoch=200,
+                )
+            return len(statements)
+
+        one_member_count = select_count(
+            [activity_store.ReportMember(1, "Member 01")]
+        )
+        many_member_count = select_count(
+            [
+                activity_store.ReportMember(user_id, f"Member {user_id:02d}")
+                for user_id in range(1, 56)
+            ]
+        )
+
+        self.assertEqual(many_member_count, one_member_count)
+        self.assertLessEqual(many_member_count, 8)

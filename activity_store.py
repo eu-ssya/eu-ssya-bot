@@ -127,6 +127,7 @@ CREATE INDEX IF NOT EXISTS idx_voice_sessions_report ON voice_sessions(guild_id,
 CREATE UNIQUE INDEX IF NOT EXISTS idx_voice_collection_runs_one_open ON voice_collection_runs(guild_id) WHERE ended_epoch IS NULL;
 CREATE INDEX IF NOT EXISTS idx_voice_collection_runs_coverage ON voice_collection_runs(guild_id,started_epoch,ended_epoch);
 CREATE INDEX IF NOT EXISTS idx_sod_eod_events_report ON sod_eod_events(guild_id,channel_id,user_id,event_date_kst,event_type);
+CREATE INDEX IF NOT EXISTS idx_sod_eod_events_last_activity ON sod_eod_events(guild_id,user_id,message_created_epoch);
 CREATE INDEX IF NOT EXISTS idx_sod_eod_daily_report ON sod_eod_daily(guild_id,event_date_kst,user_id,event_type);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sod_eod_channel_periods_one_open ON sod_eod_channel_periods(guild_id) WHERE ended_epoch IS NULL;
 CREATE INDEX IF NOT EXISTS idx_sod_eod_channel_periods_coverage ON sod_eod_channel_periods(guild_id,channel_id,started_epoch,ended_epoch);
@@ -487,41 +488,48 @@ class ActivityStore:
         )
         start_date = datetime.fromtimestamp(start_epoch, KST).date()
         end_date = datetime.fromtimestamp(end_epoch - 1, KST).date()
-        rows: list[ReportRow] = []
-        with closing(self._connect()) as conn:
-            for member in members:
+        member_ids = list(dict.fromkeys(member.user_id for member in members))
+        voice_totals = {
+            user_id: {
+                "reading_room": [0, 0],
+                "study": [0, 0],
+            }
+            for user_id in member_ids
+        }
+        last_activity_by_user: dict[int, int] = {}
+        daily_by_user: dict[int, tuple[int, int, int]] = {}
+        if member_ids:
+            placeholders = ",".join("?" for _ in member_ids)
+            selected = (guild_id, *member_ids)
+            with closing(self._connect()) as conn:
                 sessions = conn.execute(
-                    """
-                    SELECT activity_kind, started_epoch, ended_epoch
+                    f"""
+                    SELECT user_id, activity_kind, started_epoch, ended_epoch
                     FROM voice_sessions
-                    WHERE guild_id=? AND user_id=?
-                    ORDER BY started_epoch, id
+                    WHERE guild_id=? AND user_id IN ({placeholders})
+                    ORDER BY user_id, started_epoch, id
                     """,
-                    (guild_id, member.user_id),
+                    selected,
                 ).fetchall()
-                seconds = {"reading_room": 0, "study": 0}
-                counts = {"reading_room": 0, "study": 0}
-                last_activity_epoch: int | None = None
-                for activity_kind, started, ended in sessions:
+                for user_id, activity_kind, started, ended in sessions:
                     overlap = session_overlap_seconds(
                         started,
                         ended,
                         start_epoch,
                         end_epoch,
                     )
-                    seconds[activity_kind] += overlap
+                    voice_totals[user_id][activity_kind][0] += overlap
                     if overlap > 0:
-                        counts[activity_kind] += 1
+                        voice_totals[user_id][activity_kind][1] += 1
                     activity_epoch = as_of_epoch if ended is None else ended
-                    if (
-                        last_activity_epoch is None
-                        or activity_epoch > last_activity_epoch
-                    ):
-                        last_activity_epoch = activity_epoch
+                    previous = last_activity_by_user.get(user_id)
+                    if previous is None or activity_epoch > previous:
+                        last_activity_by_user[user_id] = activity_epoch
 
-                daily = conn.execute(
-                    """
+                daily_rows = conn.execute(
+                    f"""
                     SELECT
+                        user_id,
                         COUNT(DISTINCT CASE
                             WHEN event_type='sod' THEN event_date_kst
                         END),
@@ -530,50 +538,63 @@ class ActivityStore:
                         END),
                         COUNT(DISTINCT event_date_kst)
                     FROM sod_eod_daily
-                    WHERE guild_id=? AND user_id=?
+                    WHERE guild_id=? AND user_id IN ({placeholders})
                       AND event_date_kst BETWEEN ? AND ?
+                    GROUP BY user_id
                     """,
                     (
-                        guild_id,
-                        member.user_id,
+                        *selected,
                         start_date.isoformat(),
                         end_date.isoformat(),
                     ),
-                ).fetchone()
-                latest_message = conn.execute(
-                    """
-                    SELECT MAX(message_created_epoch)
-                    FROM sod_eod_events
-                    WHERE guild_id=? AND user_id=?
-                    """,
-                    (guild_id, member.user_id),
-                ).fetchone()[0]
-                if latest_message is not None and (
-                    last_activity_epoch is None
-                    or latest_message > last_activity_epoch
-                ):
-                    last_activity_epoch = latest_message
+                ).fetchall()
+                daily_by_user = {
+                    user_id: (int(sod_days), int(eod_days), int(combined_days))
+                    for user_id, sod_days, eod_days, combined_days in daily_rows
+                }
 
-                rows.append(
-                    ReportRow(
-                        user_id=member.user_id,
-                        display_name=member.display_name,
-                        last_activity_epoch=last_activity_epoch,
-                        reading_seconds=seconds["reading_room"],
-                        study_seconds=seconds["study"],
-                        reading_session_count=counts["reading_room"],
-                        study_session_count=counts["study"],
-                        sod_days=int(daily[0]),
-                        eod_days=int(daily[1]),
-                        combined_days=int(daily[2]),
-                    )
+                latest_messages = conn.execute(
+                    f"""
+                    SELECT user_id, MAX(message_created_epoch)
+                    FROM sod_eod_events
+                    WHERE guild_id=? AND user_id IN ({placeholders})
+                    GROUP BY user_id
+                    """,
+                    selected,
+                ).fetchall()
+                for user_id, latest_message in latest_messages:
+                    previous = last_activity_by_user.get(user_id)
+                    if previous is None or latest_message > previous:
+                        last_activity_by_user[user_id] = latest_message
+
+        rows = []
+        for member in members:
+            reading = voice_totals[member.user_id]["reading_room"]
+            study = voice_totals[member.user_id]["study"]
+            sod_days, eod_days, combined_days = daily_by_user.get(
+                member.user_id, (0, 0, 0)
+            )
+            rows.append(
+                ReportRow(
+                    user_id=member.user_id,
+                    display_name=member.display_name,
+                    last_activity_epoch=last_activity_by_user.get(member.user_id),
+                    reading_seconds=reading[0],
+                    study_seconds=study[0],
+                    reading_session_count=reading[1],
+                    study_session_count=study[1],
+                    sod_days=sod_days,
+                    eod_days=eod_days,
+                    combined_days=combined_days,
                 )
+            )
 
         rows.sort(
             key=lambda row: (
                 row.last_activity_epoch is not None,
                 row.last_activity_epoch or 0,
                 row.display_name.casefold(),
+                row.user_id,
             )
         )
         warnings = self._build_report_warnings(
@@ -660,21 +681,28 @@ class ActivityStore:
                         code="sod_history_unavailable",
                         text=(
                             f"조회 구간 {start_epoch}~{end_epoch} UTC epoch에 "
-                            "SoD/EoD 채널 이력 시작점을 확인할 수 없습니다."
+                            "SoD/EoD 채널 이력 시작점을 확인할 수 없습니다. "
+                            "이 조회의 값은 부분 데이터입니다."
                         ),
                     )
                 )
                 return warnings
 
-            for channel_id, period_start, period_end in periods:
-                state = conn.execute(
-                    """
-                    SELECT history_from_epoch, completed_epoch
+            channel_ids = list(dict.fromkeys(period[0] for period in periods))
+            placeholders = ",".join("?" for _ in channel_ids)
+            states = {
+                channel_id: (history_from_epoch, completed_epoch)
+                for channel_id, history_from_epoch, completed_epoch in conn.execute(
+                    f"""
+                    SELECT channel_id, history_from_epoch, completed_epoch
                     FROM activity_sync_state
-                    WHERE guild_id=? AND channel_id=?
+                    WHERE guild_id=? AND channel_id IN ({placeholders})
                     """,
-                    (guild_id, channel_id),
-                ).fetchone()
+                    (guild_id, *channel_ids),
+                )
+            }
+            for channel_id, period_start, period_end in periods:
+                state = states.get(channel_id)
                 history_from_epoch = None if state is None else state[0]
                 completed_epoch = None if state is None else state[1]
                 if history_from_epoch is None:
