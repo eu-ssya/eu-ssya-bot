@@ -49,6 +49,7 @@ class ActivityCog(commands.Cog):
         self.store_lock = asyncio.Lock()
         self.guild_locks = defaultdict(asyncio.Lock)
         self.collection_gates = defaultdict(asyncio.Event)
+        self.dirty_guilds = set()
 
     async def _store_call(self, method, *args, **kwargs):
         async with self.store_lock:
@@ -86,39 +87,50 @@ class ActivityCog(commands.Cog):
             and getattr(permissions, "read_message_history", False)
         )
 
+    @staticmethod
+    def desired_kind_for_member(member, config) -> str | None:
+        role_ids = {getattr(role, "id", None) for role in member.roles}
+        if member.bot or config.target_role_id not in role_ids:
+            return None
+        voice = getattr(member, "voice", None)
+        channel = None if voice is None else getattr(voice, "channel", None)
+        category_id = None if channel is None else getattr(channel, "category_id", None)
+        if category_id == config.reading_category_id:
+            return "reading_room"
+        if category_id == config.study_category_id:
+            return "study"
+        return None
+
     async def reconcile_member(
         self,
         member,
         effective_at_epoch: int,
+        close_reason: str = "reconciled",
         *,
-        collection_active: bool | None = None,
+        allow_closed_gate: bool = False,
     ) -> None:
         guild = getattr(member, "guild", None)
         if guild is None:
             return
+        if (
+            not allow_closed_gate
+            and not self.collection_gates[guild.id].is_set()
+        ):
+            self.dirty_guilds.add(guild.id)
+            return
         config = await self._store_call(self.store.get_config, guild.id)
-        desired_kind = None
-        active = (
-            self.collection_gates[guild.id].is_set()
-            if collection_active is None
-            else collection_active
+        desired_kind = (
+            self.desired_kind_for_member(member, config)
+            if config.voice_is_complete
+            else None
         )
-        if active and config.voice_is_complete:
-            role_ids = {getattr(role, "id", None) for role in member.roles}
-            voice = getattr(member, "voice", None)
-            channel = None if voice is None else getattr(voice, "channel", None)
-            category_id = None if channel is None else getattr(channel, "category_id", None)
-            if not member.bot and config.target_role_id in role_ids:
-                if category_id == config.reading_category_id:
-                    desired_kind = "reading_room"
-                elif category_id == config.study_category_id:
-                    desired_kind = "study"
         await self._store_call(
             self.store.reconcile_session,
             guild.id,
             member.id,
             desired_kind,
             effective_at_epoch,
+            close_reason,
         )
 
     async def full_reconcile_guild(self, guild, effective_at_epoch: int) -> None:
@@ -130,36 +142,20 @@ class ActivityCog(commands.Cog):
         self, guild, effective_at_epoch: int
     ) -> None:
         """Fully reconcile while the caller owns this guild's lock."""
-        config = await self._store_call(self.store.get_config, guild.id)
-        role = (
-            None
-            if config.target_role_id is None
-            else guild.get_role(config.target_role_id)
-        )
-        reading = (
-            None
-            if config.reading_category_id is None
-            else guild.get_channel(config.reading_category_id)
-        )
-        study = (
-            None
-            if config.study_category_id is None
-            else guild.get_channel(config.study_category_id)
-        )
-        valid = (
-            config.voice_is_complete
-            and self._same_guild_resource(role, discord.Role, guild)
-            and self._same_guild_resource(reading, discord.CategoryChannel, guild)
-            and self._same_guild_resource(study, discord.CategoryChannel, guild)
-            and reading.id != study.id
-            and self._category_is_accessible(reading, guild)
-            and self._category_is_accessible(study, guild)
-        )
-        if not valid:
-            self.collection_gates[guild.id].clear()
-            return
-        self.collection_gates[guild.id].clear()
+        gate = self.collection_gates[guild.id]
+        gate.clear()
         try:
+            config, _warnings = await self._invalidate_configured_resources_locked(
+                guild, effective_at_epoch
+            )
+            if not config.voice_is_complete:
+                await self._store_call(
+                    self.store.abort_full_reconcile,
+                    guild.id,
+                    effective_at_epoch=effective_at_epoch,
+                )
+                self.dirty_guilds.discard(guild.id)
+                return
             await self._store_call(
                 self.store.open_collection_run, guild.id, effective_at_epoch
             )
@@ -167,7 +163,7 @@ class ActivityCog(commands.Cog):
                 await self.reconcile_member(
                     member,
                     effective_at_epoch,
-                    collection_active=True,
+                    allow_closed_gate=True,
                 )
         except Exception:
             try:
@@ -179,7 +175,8 @@ class ActivityCog(commands.Cog):
             except Exception:
                 logger.exception("failed to abort activity full reconcile")
             raise
-        self.collection_gates[guild.id].set()
+        self.dirty_guilds.discard(guild.id)
+        gate.set()
 
     async def _change_voice_setting(self, guild, now_epoch: int, **change) -> None:
         async with self.guild_locks[guild.id]:
@@ -217,6 +214,131 @@ class ActivityCog(commands.Cog):
                 sod_eod_channel_id=channel_id,
                 effective_at_epoch=now_epoch,
             )
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member, before, after) -> None:
+        effective_at_epoch = utc_now_epoch()
+        guild = member.guild
+        async with self.guild_locks[guild.id]:
+            await self.reconcile_member(member, effective_at_epoch)
+
+    @commands.Cog.listener()
+    async def on_member_update(self, before, after) -> None:
+        effective_at_epoch = utc_now_epoch()
+        guild = after.guild
+        async with self.guild_locks[guild.id]:
+            config = await self._store_call(self.store.get_config, guild.id)
+            target_role_id = config.target_role_id
+            if target_role_id is None:
+                return
+            before_has_role = target_role_id in {
+                getattr(role, "id", None) for role in before.roles
+            }
+            after_has_role = target_role_id in {
+                getattr(role, "id", None) for role in after.roles
+            }
+            if before_has_role == after_has_role:
+                return
+            close_reason = (
+                "role_removed"
+                if before_has_role and not after_has_role
+                else "reconciled"
+            )
+            await self.reconcile_member(
+                after,
+                effective_at_epoch,
+                close_reason=close_reason,
+            )
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member) -> None:
+        effective_at_epoch = utc_now_epoch()
+        guild = member.guild
+        async with self.guild_locks[guild.id]:
+            await self._store_call(
+                self.store.reconcile_session,
+                guild.id,
+                member.id,
+                None,
+                effective_at_epoch,
+                "reconciled",
+            )
+
+    @commands.Cog.listener()
+    async def on_guild_available(self, guild) -> None:
+        await self.full_reconcile_guild(guild, utc_now_epoch())
+
+    @commands.Cog.listener()
+    async def on_guild_role_delete(self, role) -> None:
+        effective_at_epoch = utc_now_epoch()
+        guild = role.guild
+        async with self.guild_locks[guild.id]:
+            config = await self._store_call(self.store.get_config, guild.id)
+            if config.target_role_id != role.id:
+                return
+            self.collection_gates[guild.id].clear()
+            await self._store_call(
+                self.store.invalidate_voice_config,
+                guild.id,
+                field="target_role_id",
+                effective_at_epoch=effective_at_epoch,
+            )
+
+    @commands.Cog.listener()
+    async def on_guild_channel_delete(self, channel) -> None:
+        effective_at_epoch = utc_now_epoch()
+        guild = channel.guild
+        async with self.guild_locks[guild.id]:
+            config = await self._store_call(self.store.get_config, guild.id)
+            for field in ("reading_category_id", "study_category_id"):
+                if getattr(config, field) != channel.id:
+                    continue
+                self.collection_gates[guild.id].clear()
+                config = await self._store_call(
+                    self.store.invalidate_voice_config,
+                    guild.id,
+                    field=field,
+                    effective_at_epoch=effective_at_epoch,
+                )
+            if config.sod_eod_channel_id == channel.id:
+                await self._store_call(
+                    self.store.invalidate_sod_eod_channel,
+                    guild.id,
+                    effective_at_epoch=effective_at_epoch,
+                )
+
+    @commands.Cog.listener()
+    async def on_guild_channel_update(self, before, after) -> None:
+        effective_at_epoch = utc_now_epoch()
+        guild = after.guild
+        async with self.guild_locks[guild.id]:
+            config = await self._store_call(self.store.get_config, guild.id)
+            for field in ("reading_category_id", "study_category_id"):
+                if getattr(config, field) != after.id:
+                    continue
+                valid_category = self._same_guild_resource(
+                    after, discord.CategoryChannel, guild
+                ) and self._category_is_accessible(after, guild)
+                if valid_category:
+                    continue
+                self.collection_gates[guild.id].clear()
+                config = await self._store_call(
+                    self.store.invalidate_voice_config,
+                    guild.id,
+                    field=field,
+                    effective_at_epoch=effective_at_epoch,
+                )
+            if config.sod_eod_channel_id != after.id:
+                return
+            valid_text_channel = self._same_guild_resource(
+                after, discord.TextChannel, guild
+            ) and self._text_channel_is_accessible(after, guild)
+            if not valid_text_channel:
+                await self._store_call(
+                    self.store.invalidate_sod_eod_channel,
+                    guild.id,
+                    effective_at_epoch=effective_at_epoch,
+                )
 
     async def _validate_distinct_category(
         self, guild, *, field: str, category_id: int
@@ -361,76 +483,84 @@ class ActivityCog(commands.Cog):
     async def _invalidate_configured_resources(
         self, guild, effective_at_epoch: int
     ) -> tuple[object, list[str]]:
-        warnings = []
         async with self.guild_locks[guild.id]:
-            config = await self._store_call(self.store.get_config, guild.id)
-            checks = (
-                (
-                    "target_role_id",
-                    discord.Role,
-                    guild.get_role,
-                    "대상 역할을 찾을 수 없습니다.",
-                    None,
-                    None,
-                ),
-                (
-                    "reading_category_id",
-                    discord.CategoryChannel,
-                    guild.get_channel,
-                    "독서실 카테고리를 찾을 수 없습니다.",
-                    self._category_is_accessible,
-                    "독서실 카테고리에 접근할 수 없습니다.",
-                ),
-                (
-                    "study_category_id",
-                    discord.CategoryChannel,
-                    guild.get_channel,
-                    "스터디 카테고리를 찾을 수 없습니다.",
-                    self._category_is_accessible,
-                    "스터디 카테고리에 접근할 수 없습니다.",
-                ),
-                (
-                    "sod_eod_channel_id",
-                    discord.TextChannel,
-                    guild.get_channel,
-                    "SoD/EoD 텍스트 채널을 찾을 수 없습니다.",
-                    self._text_channel_is_accessible,
-                    "SoD/EoD 텍스트 채널에 접근할 수 없습니다.",
-                ),
+            return await self._invalidate_configured_resources_locked(
+                guild, effective_at_epoch
             )
-            for (
-                field,
-                resource_type,
-                resolver,
-                missing_warning,
-                access_check,
-                access_warning,
-            ) in checks:
-                resource_id = getattr(config, field)
-                if resource_id is None:
-                    continue
-                resource = resolver(resource_id)
-                if not self._same_guild_resource(resource, resource_type, guild):
-                    warning = missing_warning
-                elif access_check is not None and not access_check(resource, guild):
-                    warning = access_warning
-                else:
-                    continue
-                if field == "sod_eod_channel_id":
-                    config = await self._store_call(
-                        self.store.invalidate_sod_eod_channel,
-                        guild.id,
-                        effective_at_epoch=effective_at_epoch,
-                    )
-                else:
-                    config = await self._store_call(
-                        self.store.invalidate_voice_config,
-                        guild.id,
-                        field=field,
-                        effective_at_epoch=effective_at_epoch,
-                    )
-                    self.collection_gates[guild.id].clear()
-                warnings.append(warning)
+
+    async def _invalidate_configured_resources_locked(
+        self, guild, effective_at_epoch: int
+    ) -> tuple[object, list[str]]:
+        """Revalidate configured objects while the caller owns the guild lock."""
+        warnings = []
+        config = await self._store_call(self.store.get_config, guild.id)
+        checks = (
+            (
+                "target_role_id",
+                discord.Role,
+                guild.get_role,
+                "대상 역할을 찾을 수 없습니다.",
+                None,
+                None,
+            ),
+            (
+                "reading_category_id",
+                discord.CategoryChannel,
+                guild.get_channel,
+                "독서실 카테고리를 찾을 수 없습니다.",
+                self._category_is_accessible,
+                "독서실 카테고리에 접근할 수 없습니다.",
+            ),
+            (
+                "study_category_id",
+                discord.CategoryChannel,
+                guild.get_channel,
+                "스터디 카테고리를 찾을 수 없습니다.",
+                self._category_is_accessible,
+                "스터디 카테고리에 접근할 수 없습니다.",
+            ),
+            (
+                "sod_eod_channel_id",
+                discord.TextChannel,
+                guild.get_channel,
+                "SoD/EoD 텍스트 채널을 찾을 수 없습니다.",
+                self._text_channel_is_accessible,
+                "SoD/EoD 텍스트 채널에 접근할 수 없습니다.",
+            ),
+        )
+        for (
+            field,
+            resource_type,
+            resolver,
+            missing_warning,
+            access_check,
+            access_warning,
+        ) in checks:
+            resource_id = getattr(config, field)
+            if resource_id is None:
+                continue
+            resource = resolver(resource_id)
+            if not self._same_guild_resource(resource, resource_type, guild):
+                warning = missing_warning
+            elif access_check is not None and not access_check(resource, guild):
+                warning = access_warning
+            else:
+                continue
+            if field == "sod_eod_channel_id":
+                config = await self._store_call(
+                    self.store.invalidate_sod_eod_channel,
+                    guild.id,
+                    effective_at_epoch=effective_at_epoch,
+                )
+            else:
+                self.collection_gates[guild.id].clear()
+                config = await self._store_call(
+                    self.store.invalidate_voice_config,
+                    guild.id,
+                    field=field,
+                    effective_at_epoch=effective_at_epoch,
+                )
+            warnings.append(warning)
         return config, warnings
 
     @settings_group.command(name="상태", description="활동 수집 설정 상태를 표시합니다.")
