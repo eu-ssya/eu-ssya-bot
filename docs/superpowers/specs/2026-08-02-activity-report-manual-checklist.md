@@ -131,6 +131,8 @@ $topology | Format-List
 - [ ] 메시지가 없는 채널도 최초 과거동기화의 history 조회 시작 직전 snowflake 경계가 exclusive cursor로 생기며, 조회 종료~완료 기록 사이 및 같은 millisecond에 도착한 메시지가 이후 delta에서 회수된다.
 - [ ] 구형 DB의 실제 메시지 cursor 없는 완료 상태는 미완료로 전환되고, history 전체 자동 조회 없이 명시적 과거동기화를 기다린다.
 - [ ] 최초 동기화 뒤 Gateway/guild unavailable 복귀 시 누락 메시지가 자동 delta로 보충되고, 준비 DB 쓰기나 권한/API 실패 직후부터 완료 상태 대신 부분 데이터 경고와 중복 없는 지연 재시도가 유지된다.
+- [ ] guild unavailable 중 Gateway resume가 겹쳐도 가장 최근 outage 시각에 음성 세션/run이 닫히고 gate와 outage 상태가 유지되며, guild available 뒤에만 현재 상태가 다시 열린다.
+- [ ] 자동 동기화 재시도와 부분 경고가 대기 중일 때 관리자의 과거동기화가 성공하면 재시도 task와 임시 경고가 정리되고, 실패하거나 취소하면 그대로 유지된다.
 - [ ] `/활동현황 최근 일수:<N>` 보고서를 열었다.
 - [ ] `/활동현황 기간 시작일:<YYYY-MM-DD> 종료일:<YYYY-MM-DD>` 보고서를 열었다.
 - [ ] 관리자 본인이 이전/다음/TXT 버튼을 사용할 수 있고 TXT가 ephemeral 첨부로 온다.

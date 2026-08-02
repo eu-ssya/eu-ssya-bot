@@ -1112,6 +1112,109 @@ class RecoveryLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(await coverage_gaps(cog, 100, 240), [(160, 200)])
 
+    async def test_newer_resume_owns_queued_unavailable_when_guild_is_available(self):
+        cog, guild, member = self.make_cog()
+        await prepare_sync_marker(cog, channel_id=40, message_id=40)
+        await cog._store_call(cog.store.mark_backfill_completed, 1, 40, 120)
+        await recover_after_ready_for_test(cog, 100)
+        delta = make_history_channel(
+            guild,
+            40,
+            [SodEodCollectionTests.full_message(41, member, guild.get_channel(40))],
+        )
+        guild.channels = [item for item in guild.channels if item.id != 40] + [delta]
+        guild.unavailable = False
+        holder_entered = asyncio.Event()
+        release_holder = asyncio.Event()
+
+        async def hold_lock():
+            async with cog.guild_locks[guild.id]:
+                holder_entered.set()
+                await release_holder.wait()
+
+        holder = asyncio.create_task(hold_lock())
+        await holder_entered.wait()
+        with mock.patch("activity_cog.utc_now_epoch", return_value=160):
+            unavailable = asyncio.create_task(cog.on_guild_unavailable(guild))
+            await asyncio.sleep(0)
+        with mock.patch("activity_cog.utc_now_epoch", return_value=200):
+            resumed = asyncio.create_task(cog.on_resumed())
+            await asyncio.sleep(0)
+
+        self.assertEqual(cog._collection_generations[guild.id], 3)
+        self.assertEqual(cog._guild_unavailable_epochs, {guild.id: 160})
+        release_holder.set()
+        await asyncio.gather(holder, unavailable, resumed)
+
+        self.assertTrue(cog.collection_gates[guild.id].is_set())
+        self.assertEqual(cog._guild_unavailable_epochs, {})
+        self.assertEqual(
+            await session_rows(cog, member.id),
+            [
+                ("reading_room", 100, 160, "gateway_disconnect"),
+                ("reading_room", 200, None, None),
+            ],
+        )
+        self.assertEqual(
+            await cog._store_call(cog.store.list_runs, guild.id),
+            [
+                (1, 1, 1, "restart_checkpoint"),
+                (100, 100, 160, "gateway_disconnect"),
+                (200, 200, None, None),
+            ],
+        )
+        self.assertEqual(await coverage_gaps(cog, 100, 240), [(160, 200)])
+        self.assertEqual(SodEodCollectionTests.count_events(cog), 1)
+        self.assertIsNotNone((await sync_state(cog, 40)).completed_epoch)
+
+    async def test_newer_resume_closes_queued_unavailable_but_waits_for_available(self):
+        cog, guild, member = self.make_cog()
+        await recover_after_ready_for_test(cog, 100)
+        guild.unavailable = True
+        holder_entered = asyncio.Event()
+        release_holder = asyncio.Event()
+
+        async def hold_lock():
+            async with cog.guild_locks[guild.id]:
+                holder_entered.set()
+                await release_holder.wait()
+
+        holder = asyncio.create_task(hold_lock())
+        await holder_entered.wait()
+        with mock.patch("activity_cog.utc_now_epoch", return_value=160):
+            unavailable = asyncio.create_task(cog.on_guild_unavailable(guild))
+            await asyncio.sleep(0)
+        with mock.patch("activity_cog.utc_now_epoch", return_value=200):
+            resumed = asyncio.create_task(cog.on_resumed())
+            await asyncio.sleep(0)
+        release_holder.set()
+        await asyncio.gather(holder, unavailable, resumed)
+
+        self.assertFalse(cog.collection_gates[guild.id].is_set())
+        self.assertEqual(cog._guild_unavailable_epochs, {guild.id: 160})
+        self.assertEqual(
+            await session_rows(cog, member.id),
+            [("reading_room", 100, 160, "gateway_disconnect")],
+        )
+        self.assertEqual(
+            await cog._store_call(cog.store.list_runs, guild.id),
+            [
+                (1, 1, 1, "restart_checkpoint"),
+                (100, 100, 160, "gateway_disconnect"),
+            ],
+        )
+        self.assertEqual(
+            await cog._store_call(cog.store.count_open_sessions, guild.id),
+            0,
+        )
+
+        guild.unavailable = False
+        with mock.patch("activity_cog.utc_now_epoch", return_value=220):
+            await cog.on_guild_available(guild)
+        self.assertTrue(cog.collection_gates[guild.id].is_set())
+        self.assertEqual(cog._guild_unavailable_epochs, {})
+        self.assertEqual(await coverage_gaps(cog, 100, 240), [(160, 220)])
+
     async def test_newer_resume_owns_queued_available_guild_outage_recovery(self):
         cog, guild, member = self.make_cog()
         await prepare_sync_marker(cog, channel_id=40, message_id=40)
@@ -1206,6 +1309,101 @@ class RecoveryLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(await coverage_gaps(cog, 100, 240), [(160, 220)])
 
+    async def test_newer_unavailable_supersedes_mid_reconcile_with_latest_epoch(self):
+        cog, guild, member = self.make_cog()
+        await recover_after_ready_for_test(cog, 100)
+        guild.unavailable = True
+        with mock.patch("activity_cog.utc_now_epoch", return_value=160):
+            await cog.on_guild_unavailable(guild)
+        guild.unavailable = False
+
+        store_entered = threading.Event()
+        release_store = threading.Event()
+        original_list_open = cog.store.list_open_session_user_ids
+
+        def pause_after_recovery_rows_are_open(guild_id):
+            result = original_list_open(guild_id)
+            store_entered.set()
+            release_store.wait(5)
+            return result
+
+        with mock.patch.object(
+            cog.store,
+            "list_open_session_user_ids",
+            side_effect=pause_after_recovery_rows_are_open,
+        ), mock.patch("activity_cog.logger.exception") as log_exception:
+            with mock.patch("activity_cog.utc_now_epoch", return_value=200):
+                available = asyncio.create_task(cog.on_guild_available(guild))
+                while not store_entered.is_set():
+                    await asyncio.sleep(0)
+            guild.unavailable = True
+            with mock.patch("activity_cog.utc_now_epoch", return_value=210):
+                unavailable = asyncio.create_task(cog.on_guild_unavailable(guild))
+                await asyncio.sleep(0)
+            self.assertEqual(cog._collection_generations[guild.id], 4)
+            self.assertEqual(cog._guild_unavailable_epochs, {guild.id: 210})
+            release_store.set()
+            await asyncio.gather(available, unavailable)
+
+        log_exception.assert_not_called()
+        self.assertFalse(cog.collection_gates[guild.id].is_set())
+        self.assertEqual(cog._guild_unavailable_epochs, {guild.id: 210})
+        self.assertEqual(cog._guild_available_recovery_requests, set())
+        self.assertEqual(
+            await session_rows(cog, member.id),
+            [
+                ("reading_room", 100, 160, "gateway_disconnect"),
+                ("reading_room", 200, 210, "gateway_disconnect"),
+            ],
+        )
+        self.assertEqual(
+            await cog._store_call(cog.store.list_runs, guild.id),
+            [
+                (1, 1, 1, "restart_checkpoint"),
+                (100, 100, 160, "gateway_disconnect"),
+                (200, 200, 210, "gateway_disconnect"),
+            ],
+        )
+        self.assertEqual(
+            await cog._store_call(cog.store.count_open_sessions, guild.id),
+            0,
+        )
+        self.assertEqual(
+            await coverage_gaps(cog, 100, 240),
+            [(160, 200), (210, 240)],
+        )
+
+    async def test_duplicate_unavailable_is_idempotent_and_epoch_is_monotonic(self):
+        cog, guild, member = self.make_cog()
+        await recover_after_ready_for_test(cog, 100)
+        guild.unavailable = True
+
+        with mock.patch("activity_cog.utc_now_epoch", return_value=160):
+            await cog.on_guild_unavailable(guild)
+        with mock.patch("activity_cog.utc_now_epoch", return_value=150):
+            await cog.on_guild_unavailable(guild)
+        self.assertEqual(cog._guild_unavailable_epochs, {guild.id: 160})
+        with mock.patch("activity_cog.utc_now_epoch", return_value=170):
+            await cog.on_guild_unavailable(guild)
+
+        self.assertEqual(cog._guild_unavailable_epochs, {guild.id: 170})
+        self.assertFalse(cog.collection_gates[guild.id].is_set())
+        self.assertEqual(
+            await session_rows(cog, member.id),
+            [("reading_room", 100, 160, "gateway_disconnect")],
+        )
+        self.assertEqual(
+            await cog._store_call(cog.store.list_runs, guild.id),
+            [
+                (1, 1, 1, "restart_checkpoint"),
+                (100, 100, 160, "gateway_disconnect"),
+            ],
+        )
+        self.assertEqual(
+            await cog._store_call(cog.store.count_open_sessions, guild.id),
+            0,
+        )
+
     async def test_prepare_write_failure_forces_report_warning_until_retry_catches_up(self):
         cog, guild, _member = self.make_cog()
         await prepare_sync_marker(cog, channel_id=40, message_id=40)
@@ -1254,6 +1452,7 @@ class RecoveryLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await retry_task
 
         self.assertEqual(attempts, 2)
+        self.assertFalse(retry_task.cancelled())
         self.assertNotIn(guild.id, cog._text_recovery_pending_guild_ids)
         self.assertEqual(cog._text_sync_retry_tasks, {})
         self.assertIsNotNone((await sync_state(cog, 40)).completed_epoch)
@@ -2905,6 +3104,104 @@ class SodEodCollectionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.count_events(cog), 1)
         self.assertIsNotNone((await sync_state(cog, 40)).completed_epoch)
+
+    async def test_operator_backfill_success_clears_pending_and_cancels_retry(self):
+        cog, guild, _member = self.make_fixture()
+        self.addAsyncCleanup(cog.cog_unload)
+        retry_release = asyncio.Event()
+
+        async def wait_for_retry():
+            await retry_release.wait()
+
+        cog._text_recovery_pending_guild_ids.add(guild.id)
+        with mock.patch.object(
+            cog,
+            "_wait_for_text_sync_retry",
+            side_effect=wait_for_retry,
+        ):
+            retry_task = cog._schedule_text_sync_retry(guild)
+            await asyncio.sleep(0)
+            result = await cog.backfill_current_channel(
+                guild,
+                channel=guild.get_channel(40),
+            )
+
+        self.assertEqual(result.processed_count, 0)
+        self.assertNotIn(guild.id, cog._text_recovery_pending_guild_ids)
+        self.assertEqual(cog._text_sync_retry_tasks, {})
+        self.assertTrue(retry_task.cancelled())
+
+    async def test_operator_backfill_failure_keeps_pending_retry_owner(self):
+        cog, guild, _member = self.make_fixture()
+        self.addAsyncCleanup(cog.cog_unload)
+        retry_release = asyncio.Event()
+
+        async def wait_for_retry():
+            await retry_release.wait()
+
+        history_error = self.http_error()
+
+        async def fail_history():
+            raise history_error
+
+        channel = make_history_channel(
+            guild,
+            40,
+            [],
+            before_first_yield=fail_history,
+        )
+        cog._text_recovery_pending_guild_ids.add(guild.id)
+        with mock.patch.object(
+            cog,
+            "_wait_for_text_sync_retry",
+            side_effect=wait_for_retry,
+        ):
+            retry_task = cog._schedule_text_sync_retry(guild)
+            await asyncio.sleep(0)
+            with self.assertRaises(discord.HTTPException) as raised:
+                await cog.backfill_current_channel(guild, channel=channel)
+
+        self.assertIs(raised.exception, history_error)
+        self.assertIn(guild.id, cog._text_recovery_pending_guild_ids)
+        self.assertIs(cog._text_sync_retry_tasks[guild.id], retry_task)
+        self.assertFalse(retry_task.done())
+
+    async def test_cancelled_operator_backfill_keeps_pending_retry_owner(self):
+        cog, guild, _member = self.make_fixture()
+        self.addAsyncCleanup(cog.cog_unload)
+        retry_release = asyncio.Event()
+
+        async def wait_for_retry():
+            await retry_release.wait()
+
+        history_entered = asyncio.Event()
+        history_release = asyncio.Event()
+        channel = make_controlled_history_channel(
+            guild,
+            40,
+            [],
+            history_entered,
+            history_release,
+        )
+        cog._text_recovery_pending_guild_ids.add(guild.id)
+        with mock.patch.object(
+            cog,
+            "_wait_for_text_sync_retry",
+            side_effect=wait_for_retry,
+        ):
+            retry_task = cog._schedule_text_sync_retry(guild)
+            await asyncio.sleep(0)
+            backfill = asyncio.create_task(
+                cog.backfill_current_channel(guild, channel=channel)
+            )
+            await history_entered.wait()
+            backfill.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await backfill
+
+        self.assertIn(guild.id, cog._text_recovery_pending_guild_ids)
+        self.assertIs(cog._text_sync_retry_tasks[guild.id], retry_task)
+        self.assertFalse(retry_task.done())
 
     async def test_forbidden_member_fetch_keeps_cursor_for_successful_retry(self):
         cog, guild, member = self.make_fixture()
