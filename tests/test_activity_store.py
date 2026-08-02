@@ -341,6 +341,77 @@ class VoiceSessionTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_snapshot_close_uses_each_checkpoint_and_leaves_new_row_open(self):
+        self.store.reconcile_session(1, 2, "study", 50)
+        self.store.open_collection_run(1, 40)
+        self.store.checkpoint_open_rows(1, 70)
+        snapshot = self.store.snapshot_open_row_ids(1)
+
+        self.store.reconcile_session(1, 3, "reading_room", 80)
+        self.store.close_snapshot_rows_at_checkpoint(
+            snapshot,
+            "restart_checkpoint",
+        )
+
+        self.assertEqual(
+            self.store.list_sessions(1, 2),
+            [("study", 50, 70, "restart_checkpoint")],
+        )
+        self.assertEqual(
+            self.store.list_sessions(1, 3),
+            [("reading_room", 80, None, None)],
+        )
+        self.assertEqual(
+            self.store.list_runs(1),
+            [(40, 70, 70, "restart_checkpoint")],
+        )
+
+    def test_snapshot_close_is_atomic_when_run_update_fails(self):
+        self.store.reconcile_session(1, 2, "study", 50)
+        self.store.open_collection_run(1, 40)
+        self.store.checkpoint_open_rows(1, 70)
+        snapshot = self.store.snapshot_open_row_ids(1)
+        with closing(self.store._connect()) as conn:
+            conn.execute(
+                """
+                CREATE TRIGGER fail_snapshot_run_update
+                BEFORE UPDATE ON voice_collection_runs
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced snapshot failure');
+                END
+                """
+            )
+            conn.commit()
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.close_snapshot_rows_at_checkpoint(
+                snapshot,
+                "restart_checkpoint",
+            )
+
+        self.assertEqual(
+            self.store.list_sessions(1, 2),
+            [("study", 50, None, None)],
+        )
+        self.assertEqual(
+            self.store.list_runs(1),
+            [(40, 70, None, None)],
+        )
+
+    def test_snapshot_close_rejects_unknown_table_before_writing(self):
+        self.store.reconcile_session(1, 2, "study", 50)
+
+        with self.assertRaises(ValueError):
+            self.store.close_snapshot_rows_at_checkpoint(
+                [("activity_config", 1, 50)],
+                "restart_checkpoint",
+            )
+
+        self.assertEqual(
+            self.store.list_sessions(1, 2),
+            [("study", 50, None, None)],
+        )
+
     def test_kind_transition_and_clip(self):
         self.store.reconcile_session(1, 2, "reading_room", 100)
         self.store.reconcile_session(1, 2, "reading_room", 130)

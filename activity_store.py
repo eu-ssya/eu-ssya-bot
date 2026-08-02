@@ -8,6 +8,11 @@ from pathlib import Path
 
 KST = timezone(timedelta(hours=9), "KST")
 _UNSET = object()
+_SNAPSHOT_ROW_TABLES = {
+    "voice_sessions": "closed_reason",
+    "voice_collection_runs": "ended_reason",
+}
+_SNAPSHOT_CLOSE_REASONS = {"gateway_disconnect", "restart_checkpoint"}
 
 
 def _require_integer_epochs(**epochs: int) -> None:
@@ -329,6 +334,72 @@ class ActivityStore:
                 conn.rollback()
                 raise
 
+    def snapshot_open_row_ids(
+        self, guild_id: int
+    ) -> list[tuple[str, int, int]]:
+        with closing(self._connect()) as conn:
+            sessions = conn.execute(
+                """
+                SELECT id, last_checkpoint_epoch
+                FROM voice_sessions
+                WHERE guild_id=? AND ended_epoch IS NULL
+                ORDER BY id
+                """,
+                (guild_id,),
+            ).fetchall()
+            runs = conn.execute(
+                """
+                SELECT id, last_checkpoint_epoch
+                FROM voice_collection_runs
+                WHERE guild_id=? AND ended_epoch IS NULL
+                ORDER BY id
+                """,
+                (guild_id,),
+            ).fetchall()
+        return [
+            ("voice_sessions", int(row_id), int(checkpoint_epoch))
+            for row_id, checkpoint_epoch in sessions
+        ] + [
+            ("voice_collection_runs", int(row_id), int(checkpoint_epoch))
+            for row_id, checkpoint_epoch in runs
+        ]
+
+    def close_snapshot_rows_at_checkpoint(
+        self,
+        snapshot: list[tuple[str, int, int]],
+        reason: str,
+    ) -> None:
+        if reason not in _SNAPSHOT_CLOSE_REASONS:
+            raise ValueError("unsupported snapshot close reason")
+        validated = []
+        for table_name, row_id, checkpoint_epoch in snapshot:
+            reason_column = _SNAPSHOT_ROW_TABLES.get(table_name)
+            if reason_column is None:
+                raise ValueError("unsupported snapshot row table")
+            if type(row_id) is not int:
+                raise TypeError("snapshot row id must be an integer")
+            _require_integer_epochs(last_checkpoint_epoch=checkpoint_epoch)
+            validated.append(
+                (table_name, reason_column, row_id, checkpoint_epoch)
+            )
+
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for table_name, reason_column, row_id, checkpoint_epoch in validated:
+                    conn.execute(
+                        f"""
+                        UPDATE {table_name}
+                        SET ended_epoch=?, {reason_column}=?
+                        WHERE id=? AND ended_epoch IS NULL
+                        """,
+                        (checkpoint_epoch, reason, row_id),
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
     def checkpoint_open_rows(self, guild_id: int, checkpoint_epoch: int) -> None:
         _require_integer_epochs(checkpoint_epoch=checkpoint_epoch)
         with closing(self._connect()) as conn:
@@ -354,6 +425,18 @@ class ActivityStore:
             except Exception:
                 conn.rollback()
                 raise
+
+    def get_open_run_checkpoint(self, guild_id: int) -> int | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT last_checkpoint_epoch
+                FROM voice_collection_runs
+                WHERE guild_id=? AND ended_epoch IS NULL
+                """,
+                (guild_id,),
+            ).fetchone()
+        return None if row is None else int(row[0])
 
     def voice_seconds_for_range(
         self,

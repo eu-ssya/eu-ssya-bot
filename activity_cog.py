@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from activity_store import ActivityStore
 
@@ -50,10 +50,144 @@ class ActivityCog(commands.Cog):
         self.guild_locks = defaultdict(asyncio.Lock)
         self.collection_gates = defaultdict(asyncio.Event)
         self.dirty_guilds = set()
+        self._collection_generations = defaultdict(int)
+        self._disconnect_epochs = {}
+        self._startup_recovered_guild_ids = set()
+        self._lifecycle_tasks = set()
+        self.recovery_task = None
+        self.checkpoint_task = None
 
     async def _store_call(self, method, *args, **kwargs):
         async with self.store_lock:
             return await asyncio.to_thread(method, *args, **kwargs)
+
+    def _track_lifecycle_task(self, task):
+        self._lifecycle_tasks.add(task)
+        task.add_done_callback(self._lifecycle_tasks.discard)
+        return task
+
+    def _suspend_collection(self, guilds) -> dict[int, int]:
+        generations = {}
+        for guild in guilds:
+            guild_id = guild.id
+            self._collection_generations[guild_id] += 1
+            generations[guild_id] = self._collection_generations[guild_id]
+            self.collection_gates[guild_id].clear()
+            self.dirty_guilds.add(guild_id)
+        return generations
+
+    async def _recover_suspended_guild_locked(
+        self,
+        guild,
+        effective_at_epoch: int,
+        close_reason: str,
+        generation: int,
+    ) -> bool:
+        snapshot = await self._store_call(
+            self.store.snapshot_open_row_ids,
+            guild.id,
+        )
+        await self._store_call(
+            self.store.close_snapshot_rows_at_checkpoint,
+            snapshot,
+            close_reason,
+        )
+        await self._full_reconcile_guild_locked(guild, effective_at_epoch)
+        if self._collection_generations[guild.id] != generation:
+            self.collection_gates[guild.id].clear()
+            return False
+        return True
+
+    async def recover_after_ready(self) -> None:
+        await self.bot.wait_until_ready()
+        effective_at_epoch = utc_now_epoch()
+        for guild in list(self.bot.guilds):
+            if guild.id in self._startup_recovered_guild_ids:
+                continue
+            try:
+                async with self.guild_locks[guild.id]:
+                    if guild.id in self._startup_recovered_guild_ids:
+                        continue
+                    generation = self._suspend_collection((guild,))[guild.id]
+                    close_reason = (
+                        "gateway_disconnect"
+                        if guild.id in self._disconnect_epochs
+                        else "restart_checkpoint"
+                    )
+                    recovered = await self._recover_suspended_guild_locked(
+                        guild,
+                        effective_at_epoch,
+                        close_reason,
+                        generation,
+                    )
+                    if recovered:
+                        self._startup_recovered_guild_ids.add(guild.id)
+                        self._disconnect_epochs.pop(guild.id, None)
+            except Exception:
+                logger.exception(
+                    "activity startup recovery failed for guild %s",
+                    guild.id,
+                )
+
+    @tasks.loop(seconds=60.0)
+    async def checkpoint_loop(self) -> None:
+        await self._checkpoint_open_rows_once()
+
+    async def _checkpoint_open_rows_once(self) -> None:
+        checkpoint_epoch = utc_now_epoch()
+        for guild in list(self.bot.guilds):
+            try:
+                async with self.guild_locks[guild.id]:
+                    if not self.collection_gates[guild.id].is_set():
+                        continue
+                    await self._store_call(
+                        self.store.checkpoint_open_rows,
+                        guild.id,
+                        checkpoint_epoch,
+                    )
+            except Exception:
+                logger.exception(
+                    "activity checkpoint failed for guild %s",
+                    guild.id,
+                )
+
+    async def cog_load(self) -> None:
+        if self.recovery_task is None or self.recovery_task.done():
+            self.recovery_task = self._track_lifecycle_task(
+                asyncio.create_task(self.recover_after_ready())
+            )
+        if not self.checkpoint_loop.is_running():
+            self.checkpoint_task = self._track_lifecycle_task(
+                self.checkpoint_loop.start()
+            )
+
+    async def cog_unload(self) -> None:
+        tasks_to_wait = set(self._lifecycle_tasks)
+        if self.checkpoint_loop.is_running():
+            self.checkpoint_loop.cancel()
+        if self.recovery_task is not None and not self.recovery_task.done():
+            self.recovery_task.cancel()
+        if tasks_to_wait:
+            await asyncio.gather(*tasks_to_wait, return_exceptions=True)
+        self._lifecycle_tasks.difference_update(tasks_to_wait)
+
+        guilds = list(self.bot.guilds)
+        self._suspend_collection(guilds)
+        effective_at_epoch = utc_now_epoch()
+        for guild in guilds:
+            try:
+                async with self.guild_locks[guild.id]:
+                    await self._store_call(
+                        self.store.close_open_rows,
+                        guild.id,
+                        effective_at_epoch,
+                        "graceful_shutdown",
+                    )
+            except Exception:
+                logger.exception(
+                    "activity graceful cleanup failed for guild %s",
+                    guild.id,
+                )
 
     @staticmethod
     def _same_guild_resource(resource, resource_type, guild) -> bool:
@@ -292,6 +426,9 @@ class ActivityCog(commands.Cog):
         effective_at_epoch = utc_now_epoch()
         guild = member.guild
         async with self.guild_locks[guild.id]:
+            if not self.collection_gates[guild.id].is_set():
+                self.dirty_guilds.add(guild.id)
+                return
             await self._store_call(
                 self.store.reconcile_session,
                 guild.id,
@@ -300,6 +437,56 @@ class ActivityCog(commands.Cog):
                 effective_at_epoch,
                 "reconciled",
             )
+
+    @commands.Cog.listener()
+    async def on_disconnect(self) -> None:
+        observed_epoch = utc_now_epoch()
+        guilds = list(self.bot.guilds)
+        self._suspend_collection(guilds)
+        for guild in guilds:
+            disconnect_epoch = self._disconnect_epochs.setdefault(
+                guild.id,
+                observed_epoch,
+            )
+            try:
+                async with self.guild_locks[guild.id]:
+                    await self._store_call(
+                        self.store.close_open_rows,
+                        guild.id,
+                        disconnect_epoch,
+                        "gateway_disconnect",
+                    )
+            except Exception:
+                logger.exception(
+                    "activity disconnect close failed for guild %s",
+                    guild.id,
+                )
+
+    @commands.Cog.listener()
+    async def on_resumed(self) -> None:
+        effective_at_epoch = utc_now_epoch()
+        for guild in list(self.bot.guilds):
+            try:
+                async with self.guild_locks[guild.id]:
+                    generation = self._suspend_collection((guild,))[guild.id]
+                    close_reason = (
+                        "gateway_disconnect"
+                        if guild.id in self._disconnect_epochs
+                        else "restart_checkpoint"
+                    )
+                    recovered = await self._recover_suspended_guild_locked(
+                        guild,
+                        effective_at_epoch,
+                        close_reason,
+                        generation,
+                    )
+                    if recovered:
+                        self._disconnect_epochs.pop(guild.id, None)
+            except Exception:
+                logger.exception(
+                    "activity resume recovery failed for guild %s",
+                    guild.id,
+                )
 
     @commands.Cog.listener()
     async def on_guild_available(self, guild) -> None:

@@ -19,10 +19,16 @@ from tests.activity_fixtures import (
     FakeGuild,
     FakeMember,
     configured_fixture,
+    coverage_gaps,
     fake_category,
     fake_interaction,
     fake_role,
     fake_text_channel,
+    checkpoint_once_for_test,
+    on_disconnect_for_test,
+    on_resumed_for_test,
+    recover_after_ready_for_test,
+    run_checkpoint,
     session_rows,
 )
 
@@ -714,7 +720,7 @@ class VoiceListenerTests(unittest.IsolatedAsyncioTestCase):
             [("reading_room", 100, 150, "config_changed")],
         )
 
-    async def test_member_remove_closes_open_session_even_with_closed_gate(self):
+    async def test_member_remove_marks_dirty_without_writing_when_gate_is_closed(self):
         cog, guild, member = self.make_cog()
         await cog.reconcile_member(member, 100)
         cog.collection_gates[guild.id].clear()
@@ -723,8 +729,9 @@ class VoiceListenerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             await session_rows(cog, member.id),
-            [("reading_room", 100, 150, "reconciled")],
+            [("reading_room", 100, None, None)],
         )
+        self.assertIn(guild.id, cog.dirty_guilds)
 
     async def test_incomplete_to_complete_and_complete_to_incomplete_converge(self):
         cog, guild, member = self.make_cog()
@@ -919,6 +926,237 @@ class VoiceListenerTests(unittest.IsolatedAsyncioTestCase):
             await cog._store_call(cog.store.list_runs, guild.id),
             [(1, 1, 150, "config_changed"), (150, 150, None, None)],
         )
+
+
+class RecoveryLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def make_cog(self):
+        cog, guild, member = configured_fixture()
+        self.addCleanup(cog._test_tmp.cleanup)
+        return cog, guild, member
+
+    async def test_recovery_waits_until_ready_before_capturing_now(self):
+        cog, _guild, _member = self.make_cog()
+        ready_entered = asyncio.Event()
+        release_ready = asyncio.Event()
+
+        async def wait_until_ready():
+            ready_entered.set()
+            await release_ready.wait()
+
+        cog.bot.wait_until_ready = wait_until_ready
+        with mock.patch("activity_cog.utc_now_epoch", return_value=100) as now:
+            recovery = asyncio.create_task(cog.recover_after_ready())
+            await ready_entered.wait()
+            self.assertEqual(now.call_count, 0)
+            release_ready.set()
+            await recovery
+
+        now.assert_called_once_with()
+
+    async def test_hard_restart_closes_at_checkpoint_and_starts_fresh_at_now(self):
+        cog, guild, member = self.make_cog()
+        await cog._store_call(
+            cog.store.reconcile_session,
+            guild.id,
+            member.id,
+            "study",
+            50,
+        )
+        await cog._store_call(cog.store.checkpoint_open_rows, guild.id, 80)
+        guild.members = [member.in_category(20)]
+
+        await recover_after_ready_for_test(cog, 100)
+
+        self.assertEqual(
+            await session_rows(cog, member.id),
+            [
+                ("study", 50, 80, "restart_checkpoint"),
+                ("reading_room", 100, None, None),
+            ],
+        )
+        self.assertEqual(
+            await cog._store_call(cog.store.list_runs, guild.id),
+            [
+                (1, 80, 80, "restart_checkpoint"),
+                (100, 100, None, None),
+            ],
+        )
+        self.assertTrue(cog.collection_gates[guild.id].is_set())
+
+    async def test_recovery_snapshot_does_not_close_row_inserted_after_snapshot(self):
+        cog, guild, member = self.make_cog()
+        await cog._store_call(
+            cog.store.reconcile_session,
+            guild.id,
+            member.id,
+            "study",
+            50,
+        )
+        guild.members.append(FakeMember(2, guild, {10}, 20))
+        original_snapshot = cog.store.snapshot_open_row_ids
+
+        def snapshot_then_insert(guild_id):
+            snapshot = original_snapshot(guild_id)
+            cog.store.reconcile_session(1, 2, "reading_room", 80)
+            return snapshot
+
+        with mock.patch.object(
+            cog.store,
+            "snapshot_open_row_ids",
+            side_effect=snapshot_then_insert,
+        ):
+            await recover_after_ready_for_test(cog, 100)
+
+        self.assertEqual(
+            await cog._store_call(cog.store.list_sessions, guild.id, 2),
+            [("reading_room", 80, None, None)],
+        )
+
+    async def test_recovery_reconcile_writes_while_gate_is_closed(self):
+        cog, guild, member = self.make_cog()
+        cog.collection_gates[guild.id].clear()
+
+        await recover_after_ready_for_test(cog, 100)
+
+        self.assertEqual(
+            await cog._store_call(
+                cog.store.open_session_count,
+                guild.id,
+                member.id,
+            ),
+            1,
+        )
+
+    async def test_disconnect_gap_ignores_voice_event_until_resume(self):
+        cog, guild, member = self.make_cog()
+        await recover_after_ready_for_test(cog, 100)
+
+        await on_disconnect_for_test(cog, 160)
+        await cog.on_voice_state_update(
+            member.in_category(30),
+            object(),
+            object(),
+        )
+        guild.members = [member.in_category(30)]
+        await on_resumed_for_test(cog, 200)
+
+        self.assertEqual(await coverage_gaps(cog, 100, 240), [(160, 200)])
+        self.assertEqual(
+            await session_rows(cog, member.id),
+            [
+                ("reading_room", 100, 160, "gateway_disconnect"),
+                ("study", 200, None, None),
+            ],
+        )
+
+    async def test_repeated_disconnect_resume_cycles_are_idempotent(self):
+        cog, guild, _member = self.make_cog()
+        await recover_after_ready_for_test(cog, 100)
+
+        await on_disconnect_for_test(cog, 160)
+        await on_disconnect_for_test(cog, 180)
+        await on_resumed_for_test(cog, 200)
+        await on_disconnect_for_test(cog, 220)
+        await on_disconnect_for_test(cog, 230)
+        await on_resumed_for_test(cog, 240)
+
+        self.assertEqual(
+            await cog._store_call(cog.store.list_runs, guild.id),
+            [
+                (1, 1, 1, "restart_checkpoint"),
+                (100, 100, 160, "gateway_disconnect"),
+                (200, 200, 220, "gateway_disconnect"),
+                (240, 240, None, None),
+            ],
+        )
+
+    async def test_disconnect_waiting_on_listener_lock_leaves_no_open_row(self):
+        cog, guild, member = self.make_cog()
+        await recover_after_ready_for_test(cog, 100)
+        listener_entered = asyncio.Event()
+        release_listener = asyncio.Event()
+        original_reconcile = cog.reconcile_member
+
+        async def pause_reconcile(*args, **kwargs):
+            listener_entered.set()
+            await release_listener.wait()
+            await original_reconcile(*args, **kwargs)
+
+        with mock.patch.object(cog, "reconcile_member", side_effect=pause_reconcile):
+            listener = asyncio.create_task(
+                cog.on_voice_state_update(member.in_category(30), object(), object())
+            )
+            await listener_entered.wait()
+            with mock.patch("activity_cog.utc_now_epoch", return_value=160):
+                disconnect = asyncio.create_task(cog.on_disconnect())
+                await asyncio.sleep(0)
+                self.assertFalse(cog.collection_gates[guild.id].is_set())
+                release_listener.set()
+                await asyncio.gather(listener, disconnect)
+
+        self.assertEqual(
+            await cog._store_call(cog.store.count_open_sessions, guild.id),
+            0,
+        )
+
+    async def test_closed_gate_does_not_checkpoint(self):
+        cog, guild, _member = self.make_cog()
+        before = await run_checkpoint(cog, guild.id)
+        cog.collection_gates[guild.id].clear()
+
+        with mock.patch("activity_cog.utc_now_epoch", return_value=100):
+            await checkpoint_once_for_test(cog)
+
+        self.assertEqual(await run_checkpoint(cog, guild.id), before)
+
+    async def test_cog_load_and_unload_cancel_and_await_owned_tasks(self):
+        cog, _guild, _member = self.make_cog()
+        recovery_started = asyncio.Event()
+
+        async def blocked_recovery():
+            recovery_started.set()
+            await asyncio.Event().wait()
+
+        with mock.patch.object(cog, "recover_after_ready", side_effect=blocked_recovery):
+            await cog.cog_load()
+            await recovery_started.wait()
+            recovery_task = cog.recovery_task
+            checkpoint_task = cog.checkpoint_task
+
+            await cog.cog_unload()
+
+        self.assertTrue(recovery_task.done())
+        self.assertTrue(checkpoint_task.done())
+        self.assertEqual(cog._lifecycle_tasks, set())
+
+    async def test_cog_unload_directly_closes_rows_with_graceful_reasons(self):
+        cog, guild, member = self.make_cog()
+        await cog.reconcile_member(member, 100)
+
+        with mock.patch("activity_cog.utc_now_epoch", return_value=150):
+            await cog.cog_unload()
+
+        self.assertEqual(
+            await session_rows(cog, member.id),
+            [("reading_room", 100, 150, "reconciled")],
+        )
+        self.assertEqual(
+            await cog._store_call(cog.store.list_runs, guild.id),
+            [(1, 1, 150, "graceful_shutdown")],
+        )
+
+    async def test_cog_unload_logs_cleanup_failure_and_continues(self):
+        cog, _guild, _member = self.make_cog()
+        error = sqlite3.Error("cleanup unavailable")
+
+        with mock.patch.object(
+            cog.store,
+            "close_open_rows",
+            side_effect=error,
+        ), mock.patch("activity_cog.logger.exception") as logged:
+            await cog.cog_unload()
+
+        logged.assert_called_once()
 
 
 class SettingsCommandTests(unittest.IsolatedAsyncioTestCase):
