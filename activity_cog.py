@@ -312,6 +312,9 @@ class ActivityCog(commands.Cog):
         async with self.guild_locks[guild.id]:
             config = await self._store_call(self.store.get_config, guild.id)
             if config.target_role_id != role.id:
+                await self._revalidate_configured_resources_locked(
+                    guild, effective_at_epoch
+                )
                 return
             await self._full_reconcile_guild_locked(
                 guild,

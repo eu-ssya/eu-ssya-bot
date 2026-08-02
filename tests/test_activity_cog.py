@@ -458,6 +458,70 @@ class VoiceListenerTests(unittest.IsolatedAsyncioTestCase):
             [("reading_room", 100, 150, "config_changed")],
         )
 
+    async def test_non_target_role_deletion_revalidates_voice_access_loss(self):
+        cog, guild, member = self.make_cog()
+        await cog.reconcile_member(member, 100)
+        deleted = fake_role(50, guild)
+        guild.get_channel(20).permissions_for.return_value = mock.Mock(
+            view_channel=False
+        )
+
+        await self.call_at(150, cog.on_guild_role_delete, deleted)
+
+        config = await cog._store_call(cog.store.get_config, guild.id)
+        self.assertIsNone(config.reading_category_id)
+        self.assertFalse(cog.collection_gates[guild.id].is_set())
+        self.assertNotIn(guild.id, cog.dirty_guilds)
+        self.assertEqual(
+            await session_rows(cog, member.id),
+            [("reading_room", 100, 150, "config_changed")],
+        )
+        self.assertEqual(
+            await cog._store_call(cog.store.list_runs, guild.id),
+            [(1, 1, 150, "config_invalid")],
+        )
+
+    async def test_non_target_role_deletion_sod_access_loss_preserves_voice(self):
+        cog, guild, member = self.make_cog()
+        await cog.reconcile_member(member, 100)
+        sessions_before = await cog._store_call(cog.store.list_sessions, 1, 1)
+        runs_before = await cog._store_call(cog.store.list_runs, 1)
+        count_before = await cog._store_call(
+            cog.store.voice_session_count_for_range,
+            1,
+            1,
+            "reading_room",
+            0,
+            200,
+        )
+        deleted = fake_role(50, guild)
+        guild.get_channel(40).permissions_for.return_value = mock.Mock(
+            view_channel=True,
+            read_message_history=False,
+        )
+
+        await self.call_at(150, cog.on_guild_role_delete, deleted)
+
+        config = await cog._store_call(cog.store.get_config, guild.id)
+        self.assertIsNone(config.sod_eod_channel_id)
+        self.assertTrue(cog.collection_gates[guild.id].is_set())
+        self.assertNotIn(guild.id, cog.dirty_guilds)
+        self.assertEqual(
+            await cog._store_call(cog.store.list_sessions, 1, 1), sessions_before
+        )
+        self.assertEqual(await cog._store_call(cog.store.list_runs, 1), runs_before)
+        self.assertEqual(
+            await cog._store_call(
+                cog.store.voice_session_count_for_range,
+                1,
+                1,
+                "reading_room",
+                0,
+                200,
+            ),
+            count_before,
+        )
+
     async def test_reading_category_deletion_invalidates_voice(self):
         cog, guild, member = self.make_cog()
         await cog.reconcile_member(member, 100)
