@@ -117,6 +117,39 @@ class SchemaTests(unittest.TestCase):
                 with self.assertRaises(sqlite3.IntegrityError):
                     conn.execute(statement)
 
+    def test_initialize_migrates_legacy_sync_initialization_meaning(self):
+        with closing(self.store._connect()) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE activity_sync_state (
+                    guild_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    newest_processed_message_id INTEGER,
+                    newest_processed_message_created_epoch INTEGER,
+                    history_from_epoch INTEGER,
+                    completed_epoch INTEGER,
+                    updated_epoch INTEGER NOT NULL,
+                    PRIMARY KEY(guild_id,channel_id)
+                );
+                INSERT INTO activity_sync_state VALUES
+                    (1,10,NULL,NULL,NULL,200,200),
+                    (1,11,123,100,100,NULL,150);
+                """
+            )
+
+        self.store.initialize()
+
+        completed_empty = self.store.get_sync_state(1, 10)
+        self.assertEqual(completed_empty.initialized_epoch, 200)
+        self.assertEqual(
+            completed_empty.newest_processed_message_created_epoch,
+            200,
+        )
+        self.assertIsNotNone(completed_empty.newest_processed_message_id)
+        interrupted = self.store.get_sync_state(1, 11)
+        self.assertEqual(interrupted.initialized_epoch, 150)
+        self.assertEqual(interrupted.newest_processed_message_id, 123)
+
 
 class ConfigurationTests(unittest.TestCase):
     def setUp(self):
@@ -938,6 +971,16 @@ class SodEodStoreTests(unittest.TestCase):
         self.assertEqual(delta.history_from_epoch, 50)
         self.assertEqual(delta.completed_epoch, 150)
 
+    def test_begin_current_channel_recovery_durably_clears_completion_first(self):
+        self.store.mark_backfill_completed(1, 2, 120)
+
+        prepared = self.store.begin_current_channel_recovery(1, 160)
+
+        self.assertEqual(prepared.channel_id, 2)
+        self.assertEqual(prepared.initialized_epoch, 120)
+        self.assertIsNone(prepared.completed_epoch)
+        self.assertIsNone(self.store.get_sync_state(1, 2).completed_epoch)
+
     def test_backfill_cursor_never_regresses_lexicographic_marker(self):
         self.store.record_backfill_message_and_advance_cursor(
             guild_id=1,
@@ -1037,6 +1080,10 @@ class SodEodStoreTests(unittest.TestCase):
             """,
             """
             UPDATE activity_sync_state SET updated_epoch=100.5
+            WHERE guild_id=1 AND channel_id=2
+            """,
+            """
+            UPDATE activity_sync_state SET initialized_epoch=100.5
             WHERE guild_id=1 AND channel_id=2
             """,
         ]

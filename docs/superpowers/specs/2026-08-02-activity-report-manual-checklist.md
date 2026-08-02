@@ -126,7 +126,10 @@ $topology | Format-List
   - [ ] `/활동설정 스터디 카테고리:<Category>`
   - [ ] `/활동설정 sod_eod 채널:<TextChannel>`
 - [ ] `/활동설정 상태`에서 네 설정과 수집/동기화 상태를 확인했다.
+- [ ] 최초 과거동기화 전 재시작에서는 채널 전체 history가 자동 조회되지 않고 동기화 미완료 경고가 유지된다.
 - [ ] `/활동설정 과거동기화`가 성공했다.
+- [ ] 메시지가 없는 채널도 최초 과거동기화 후 initialized cursor가 생기며, 이후 재연결은 해당 cursor 이후 delta만 조회한다.
+- [ ] 최초 동기화 뒤 Gateway/guild unavailable 복귀 시 누락 메시지가 자동 delta로 보충되고, 권한/API 실패 시 완료 상태 대신 부분 데이터 경고와 지연 재시도가 유지된다.
 - [ ] `/활동현황 최근 일수:<N>` 보고서를 열었다.
 - [ ] `/활동현황 기간 시작일:<YYYY-MM-DD> 종료일:<YYYY-MM-DD>` 보고서를 열었다.
 - [ ] 관리자 본인이 이전/다음/TXT 버튼을 사용할 수 있고 TXT가 ephemeral 첨부로 온다.
@@ -168,7 +171,7 @@ def digest(value):
     raw = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(raw.encode()).hexdigest()
 
-stable_names = ("activity_config", "activity_sync_state", "sod_eod_channel_periods")
+stable_names = ("activity_config", "sod_eod_channel_periods")
 append_names = ("sod_eod_events", "sod_eod_daily")
 stable = {name: rows(name) for name in stable_names}
 append_only = {name: rows(name) for name in append_names}
@@ -181,6 +184,7 @@ result = {
     "append_only": append_only,
     "append_counts": {name: len(value) for name, value in append_only.items()},
     "append_checksum": digest(append_only),
+    "sync_state": rows("activity_sync_state"),
     "voice_sessions": rows("voice_sessions"),
     "voice_collection_runs": rows("voice_collection_runs"),
 }
@@ -221,10 +225,10 @@ $after | ConvertTo-Json -Depth 12
 if ([int]$after.exists -ne 1) { throw "Post-restart activity.db does not exist" }
 ```
 
-설정·sync·channel period는 restart가 바꾸지 않으므로 traffic mode와 무관하게 count와 checksum이 정확히 같아야 한다.
+설정과 channel period는 restart가 바꾸지 않으므로 traffic mode와 무관하게 count와 checksum이 정확히 같아야 한다. sync state는 restart 직후 incomplete로 전환된 뒤 cursor delta 성공 시 completed/updated가 바뀌므로 아래에서 별도 검증한다.
 
 ```powershell
-$stableTables = @("activity_config", "activity_sync_state", "sod_eod_channel_periods")
+$stableTables = @("activity_config", "sod_eod_channel_periods")
 foreach ($table in $stableTables) {
     $beforeCount = [int64]$before.stable_counts.PSObject.Properties[$table].Value
     $afterCount = [int64]$after.stable_counts.PSObject.Properties[$table].Value
@@ -232,6 +236,34 @@ foreach ($table in $stableTables) {
 }
 if ($before.stable_checksum -cne $after.stable_checksum) {
     throw "Stable table checksum changed"
+}
+```
+
+sync state는 기존 채널 행과 initialization/history 의미를 보존하고 cursor가 후퇴하지 않아야 한다. 초기화된 채널은 자동 delta 성공 뒤 completed가 복구되어야 하며, 초기화 전 채널은 completed가 null인 채 history 전체 자동 조회 없이 명시적 과거동기화를 기다린다.
+
+```powershell
+$beforeSync = @($before.sync_state)
+$afterSync = @($after.sync_state)
+foreach ($row in $beforeSync) {
+    $matches = @($afterSync | Where-Object {
+        [int64]$_.guild_id -eq [int64]$row.guild_id -and
+        [int64]$_.channel_id -eq [int64]$row.channel_id
+    })
+    if ($matches.Count -ne 1) { throw "Sync row missing or duplicated: guild=$($row.guild_id) channel=$($row.channel_id)" }
+    $next = $matches[0]
+    foreach ($field in @("initialized_epoch", "history_from_epoch")) {
+        if ([string]$next.$field -cne [string]$row.$field) { throw "Sync meaning changed: channel=$($row.channel_id) field=$field" }
+    }
+    if ($null -ne $row.newest_processed_message_created_epoch -and
+        [int64]$next.newest_processed_message_created_epoch -lt [int64]$row.newest_processed_message_created_epoch) {
+        throw "Sync cursor epoch regressed: channel=$($row.channel_id)"
+    }
+    if ($null -ne $row.initialized_epoch -and $null -eq $next.completed_epoch) {
+        throw "Initialized sync did not complete automatic delta: channel=$($row.channel_id)"
+    }
+    if ($null -eq $row.initialized_epoch -and $null -ne $next.completed_epoch) {
+        throw "Uninitialized sync was incorrectly auto-completed: channel=$($row.channel_id)"
+    }
 }
 ```
 
@@ -352,7 +384,7 @@ if ($trafficMode -ceq "PAUSED") {
 }
 ```
 
-- [ ] stable 테이블은 exact count/checksum, SoD/EoD는 선택한 mode의 exact 또는 append-only 보존 규칙을 통과했다.
+- [ ] stable 설정/period 테이블은 exact count/checksum, sync는 initialization/history 보존과 cursor 비후퇴, SoD/EoD는 선택한 mode의 exact 또는 append-only 보존 규칙을 통과했다.
 - [ ] 기존 closed 음성 행은 불변이고 기존 open 음성 행은 정상 사유/시각으로 종료되었다.
 - [ ] 유효 guild의 새 open run과 `PAUSED` 테스트 멤버의 새 open session을 확인했다. `ACTIVE`면 실제 음성 이벤트와 결과를 기록했다.
 - [ ] 아래 JSON 재검증으로 restart 뒤에도 정확히 한 실행 중 Machine과 그 ID에 연결된 `bot_data` 하나를 재확인했다.

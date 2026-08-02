@@ -998,6 +998,185 @@ class RecoveryLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertGreaterEqual(now.call_count, 1)
 
+    async def test_cursorless_startup_does_not_scan_before_explicit_backfill(self):
+        cog, guild, _member = self.make_cog()
+        channel = guild.get_channel(40)
+
+        await recover_after_ready_for_test(cog, 100)
+
+        channel.history.assert_not_called()
+        state = await sync_state(cog, 40)
+        self.assertIsNone(state.initialized_epoch)
+        self.assertIsNone(state.completed_epoch)
+        report = await cog._store_call(
+            cog.store.build_report,
+            guild_id=1,
+            members=[],
+            start_epoch=1,
+            end_epoch=100,
+            as_of_epoch=100,
+        )
+        self.assertIn("sod_backfill_incomplete", {item.code for item in report.warnings})
+
+    async def test_guild_unavailable_closes_voice_and_reconciles_same_state(self):
+        cog, guild, member = self.make_cog()
+        await recover_after_ready_for_test(cog, 100)
+
+        with mock.patch("activity_cog.utc_now_epoch", return_value=160):
+            await cog.on_guild_unavailable(guild)
+        self.assertFalse(cog.collection_gates[guild.id].is_set())
+        self.assertEqual(
+            await session_rows(cog, member.id),
+            [("reading_room", 100, 160, "gateway_disconnect")],
+        )
+
+        with mock.patch("activity_cog.utc_now_epoch", return_value=200):
+            await cog.on_guild_available(guild)
+
+        self.assertEqual(await coverage_gaps(cog, 100, 240), [(160, 200)])
+        self.assertEqual(
+            await session_rows(cog, member.id),
+            [
+                ("reading_room", 100, 160, "gateway_disconnect"),
+                ("reading_room", 200, None, None),
+            ],
+        )
+
+    async def test_guild_unavailable_before_startup_recovery_uses_checkpoint(self):
+        cog, guild, member = self.make_cog()
+        await cog._store_call(
+            cog.store.reconcile_session,
+            guild.id,
+            member.id,
+            "study",
+            50,
+        )
+        await cog._store_call(cog.store.checkpoint_open_rows, guild.id, 80)
+
+        with mock.patch("activity_cog.utc_now_epoch", return_value=100):
+            await cog.on_guild_unavailable(guild)
+
+        self.assertEqual(
+            await session_rows(cog, member.id),
+            [("study", 50, 80, "gateway_disconnect")],
+        )
+        self.assertNotIn(guild.id, cog._startup_recovered_guild_ids)
+
+        guild.members = [member.in_category(20)]
+        with mock.patch("activity_cog.utc_now_epoch", return_value=120):
+            await cog.on_guild_available(guild)
+        self.assertEqual(
+            await session_rows(cog, member.id),
+            [
+                ("study", 50, 80, "gateway_disconnect"),
+                ("reading_room", 120, None, None),
+            ],
+        )
+
+    async def test_guild_unavailable_move_is_reconciled_without_outage_time(self):
+        cog, guild, member = self.make_cog()
+        await recover_after_ready_for_test(cog, 100)
+
+        with mock.patch("activity_cog.utc_now_epoch", return_value=160):
+            await cog.on_guild_unavailable(guild)
+        guild.members = [member.in_category(30)]
+        await cog.on_voice_state_update(
+            member.in_category(30),
+            object(),
+            object(),
+        )
+        with mock.patch("activity_cog.utc_now_epoch", return_value=200):
+            await cog.on_guild_available(guild)
+
+        self.assertEqual(
+            await session_rows(cog, member.id),
+            [
+                ("reading_room", 100, 160, "gateway_disconnect"),
+                ("study", 200, None, None),
+            ],
+        )
+
+    async def test_guild_unavailable_leave_does_not_reopen_voice_session(self):
+        cog, guild, member = self.make_cog()
+        await recover_after_ready_for_test(cog, 100)
+
+        with mock.patch("activity_cog.utc_now_epoch", return_value=160):
+            await cog.on_guild_unavailable(guild)
+        guild.members = [member.in_category(None)]
+        with mock.patch("activity_cog.utc_now_epoch", return_value=200):
+            await cog.on_guild_available(guild)
+
+        self.assertEqual(
+            await session_rows(cog, member.id),
+            [("reading_room", 100, 160, "gateway_disconnect")],
+        )
+        self.assertEqual(await coverage_gaps(cog, 100, 240), [(160, 200)])
+
+    async def test_connected_prepare_failure_retries_once_and_unload_cancels_duplicates(self):
+        cog, guild, member = self.make_cog()
+        await prepare_sync_marker(cog, channel_id=40, message_id=40)
+        await cog._store_call(cog.store.mark_backfill_completed, 1, 40, 120)
+        await recover_after_ready_for_test(cog, 100)
+        channel = make_history_channel(
+            guild,
+            40,
+            [SodEodCollectionTests.full_message(41, member, guild.get_channel(40))],
+        )
+        guild.channels = [item for item in guild.channels if item.id != 40] + [channel]
+        original_begin = cog.store.begin_current_channel_recovery
+        attempts = 0
+
+        def fail_once(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise sqlite3.OperationalError("temporary prepare failure")
+            return original_begin(*args, **kwargs)
+
+        retry_release = asyncio.Event()
+
+        async def wait_for_retry():
+            await retry_release.wait()
+
+        with mock.patch.object(
+            cog.store,
+            "begin_current_channel_recovery",
+            side_effect=fail_once,
+        ), mock.patch.object(
+            cog,
+            "_wait_for_text_sync_retry",
+            side_effect=wait_for_retry,
+        ), mock.patch("activity_cog.logger.exception"):
+            with mock.patch("activity_cog.utc_now_epoch", return_value=200):
+                await cog.on_guild_available(guild)
+            retry_task = cog._text_sync_retry_tasks[guild.id]
+            self.assertEqual((await sync_state(cog, 40)).completed_epoch, 100)
+            cog._schedule_text_sync_retry(guild)
+            self.assertIs(cog._text_sync_retry_tasks[guild.id], retry_task)
+            retry_release.set()
+            await retry_task
+
+        self.assertEqual(attempts, 2)
+        self.assertEqual(SodEodCollectionTests.count_events(cog), 1)
+        self.assertIsNotNone((await sync_state(cog, 40)).completed_epoch)
+        self.assertEqual(cog._text_sync_retry_tasks, {})
+
+        never_release = asyncio.Event()
+
+        async def wait_forever():
+            await never_release.wait()
+
+        with mock.patch.object(
+            cog,
+            "_wait_for_text_sync_retry",
+            side_effect=wait_forever,
+        ):
+            retry = cog._schedule_text_sync_retry(guild)
+            await asyncio.sleep(0)
+            await cog.cog_unload()
+        self.assertTrue(retry.cancelled())
+        self.assertEqual(cog._text_sync_retry_tasks, {})
+
     async def test_guild_available_during_ready_wait_owns_startup_snapshot_recovery(self):
         cog, guild, member = self.make_cog()
         await cog._store_call(
@@ -1062,6 +1241,28 @@ class RecoveryLifecycleTests(unittest.IsolatedAsyncioTestCase):
         state = await sync_state(cog, 40)
         self.assertEqual(state.newest_processed_message_id, 11)
         self.assertIsNotNone(state.completed_epoch)
+
+    async def test_startup_delta_uses_atomic_prepared_state_without_sync_preread(self):
+        cog, guild, member = self.make_cog()
+        await prepare_sync_marker(cog, channel_id=40, message_id=15)
+        await cog._store_call(cog.store.mark_backfill_completed, 1, 40, 90)
+        channel = make_history_channel(
+            guild,
+            40,
+            [SodEodCollectionTests.full_message(16, member, guild.get_channel(40))],
+        )
+        guild.channels = [item for item in guild.channels if item.id != 40] + [channel]
+
+        with mock.patch.object(
+            cog.store,
+            "get_sync_state",
+            side_effect=sqlite3.OperationalError("sync preread forbidden"),
+        ) as preread:
+            await recover_after_ready_for_test(cog, 100)
+
+        preread.assert_not_called()
+        self.assertEqual(SodEodCollectionTests.count_events(cog), 1)
+        self.assertEqual((await sync_state(cog, 40)).newest_processed_message_id, 16)
 
     async def test_disconnect_resume_delta_backfill_recovers_downtime_message(self):
         cog, guild, member = self.make_cog()
@@ -2503,6 +2704,73 @@ class SodEodCollectionTests(unittest.IsolatedAsyncioTestCase):
             after=discord.Object(id=11),
         )
         self.assertEqual((await sync_state(cog, 40)).newest_processed_message_id, 12)
+
+    async def test_explicit_empty_backfill_initializes_bounded_outage_delta(self):
+        cog, guild, member = self.make_fixture()
+        channel = guild.get_channel(40)
+
+        with mock.patch("activity_cog.utc_now_epoch", return_value=100):
+            await cog.backfill_current_channel(guild, channel=channel)
+
+        initialized = await sync_state(cog, 40)
+        self.assertEqual(initialized.initialized_epoch, 100)
+        self.assertIsNotNone(initialized.newest_processed_message_id)
+        barrier = initialized.newest_processed_message_id
+        channel.history.assert_called_once_with(
+            limit=None,
+            oldest_first=True,
+            after=None,
+        )
+
+        await on_disconnect_for_test(cog, 160)
+        delta = make_history_channel(
+            guild,
+            40,
+            [self.full_message(barrier + 1, member, channel)],
+        )
+        guild.channels = [item for item in guild.channels if item.id != 40] + [delta]
+        await on_resumed_for_test(cog, 200)
+
+        delta.history.assert_called_once_with(
+            limit=None,
+            oldest_first=True,
+            after=discord.Object(id=barrier),
+        )
+        self.assertEqual(self.count_events(cog), 1)
+        self.assertIsNotNone((await sync_state(cog, 40)).completed_epoch)
+
+    async def test_forbidden_member_fetch_keeps_cursor_for_successful_retry(self):
+        cog, guild, member = self.make_fixture()
+        channel = fake_text_channel(40, guild)
+        known = self.full_message(50, member, channel)
+        missing_author = SimpleNamespace(id=999, guild=guild, bot=False)
+        blocked = self.full_message(51, missing_author, channel)
+        channel.history.side_effect = lambda **kwargs: self._iterate([known, blocked])
+        forbidden = discord.Forbidden(
+            SimpleNamespace(status=403, reason="Forbidden", headers={}),
+            "member unavailable",
+        )
+        guild.fetch_member = mock.AsyncMock(side_effect=forbidden)
+
+        with self.assertRaises(discord.Forbidden):
+            await cog.backfill_current_channel(guild, channel=channel)
+
+        interrupted = await sync_state(cog, 40)
+        self.assertEqual(interrupted.newest_processed_message_id, 50)
+        self.assertIsNone(interrupted.completed_epoch)
+
+        recovered_member = FakeMember(999, guild, {10})
+        guild.fetch_member = mock.AsyncMock(return_value=recovered_member)
+        retry = make_history_channel(guild, 40, [blocked])
+        await cog.backfill_current_channel(guild, channel=retry)
+
+        retry.history.assert_called_once_with(
+            limit=None,
+            oldest_first=True,
+            after=discord.Object(id=50),
+        )
+        self.assertEqual((await sync_state(cog, 40)).newest_processed_message_id, 51)
+        self.assertIsNotNone((await sync_state(cog, 40)).completed_epoch)
 
     async def test_backfill_streams_distinct_authors_with_bounded_lru_eviction(self):
         from activity_cog import AUTHOR_ELIGIBILITY_CACHE_LIMIT

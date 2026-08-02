@@ -33,6 +33,8 @@ REPORT_PAGE_SIZE = 15
 REPORT_CONTENT_LIMIT = 1900
 REPORT_VIEW_TIMEOUT_SECONDS = 600
 REPORT_WARNING_SUMMARY_LIMIT = 120
+TEXT_SYNC_RETRY_DELAY_SECONDS = 30.0
+_TEXT_RECOVERY_PREPARE_FAILED = object()
 
 
 def detect_sod_eod(content: str) -> set[str]:
@@ -373,9 +375,13 @@ class ActivityCog(commands.Cog):
         self.dirty_guilds = set()
         self._collection_generations = defaultdict(int)
         self._disconnect_epochs = {}
+        self._guild_unavailable_epochs = {}
         self._startup_recovered_guild_ids = set()
         self._lifecycle_tasks = set()
         self._store_worker_tasks = set()
+        self._text_sync_retry_tasks = {}
+        self.text_sync_retry_delay_seconds = TEXT_SYNC_RETRY_DELAY_SECONDS
+        self._unloading = False
         self.recovery_task = None
         self.checkpoint_task = None
 
@@ -507,6 +513,55 @@ class ActivityCog(commands.Cog):
         task.add_done_callback(self._lifecycle_tasks.discard)
         return task
 
+    async def _wait_for_text_sync_retry(self) -> None:
+        await asyncio.sleep(self.text_sync_retry_delay_seconds)
+
+    def _schedule_text_sync_retry(self, guild):
+        if self._unloading:
+            return None
+        existing = self._text_sync_retry_tasks.get(guild.id)
+        if existing is not None and not existing.done():
+            return existing
+        task = self._track_lifecycle_task(
+            asyncio.create_task(self._text_sync_retry_worker(guild))
+        )
+        self._text_sync_retry_tasks[guild.id] = task
+
+        def discard_retry(completed_task):
+            if self._text_sync_retry_tasks.get(guild.id) is completed_task:
+                self._text_sync_retry_tasks.pop(guild.id, None)
+
+        task.add_done_callback(discard_retry)
+        return task
+
+    async def _text_sync_retry_worker(self, guild) -> None:
+        while not self._unloading:
+            await self._wait_for_text_sync_retry()
+            try:
+                async with self.guild_locks[guild.id]:
+                    state = await self._store_call(
+                        self.store.begin_current_channel_recovery,
+                        guild.id,
+                        utc_now_epoch(),
+                    )
+                    if (
+                        guild.id in self._disconnect_epochs
+                        or guild.id in self._guild_unavailable_epochs
+                    ):
+                        return
+                    if await self._finish_current_text_recovery_locked(
+                        guild,
+                        state,
+                    ):
+                        return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "activity automatic SoD/EoD retry failed for guild %s",
+                    guild.id,
+                )
+
     def _suspend_collection(self, guilds) -> dict[int, int]:
         generations = {}
         for guild in guilds:
@@ -542,6 +597,29 @@ class ActivityCog(commands.Cog):
         )
         return self._collection_generations[guild.id] == generation
 
+    async def _close_for_outage_locked(
+        self,
+        guild,
+        outage_epoch: int,
+    ) -> None:
+        if guild.id in self._startup_recovered_guild_ids:
+            await self._store_call(
+                self.store.close_open_rows,
+                guild.id,
+                outage_epoch,
+                "gateway_disconnect",
+            )
+            return
+        snapshot = await self._store_call(
+            self.store.snapshot_open_row_ids,
+            guild.id,
+        )
+        await self._store_call(
+            self.store.close_snapshot_rows_at_checkpoint,
+            snapshot,
+            "gateway_disconnect",
+        )
+
     async def _recover_startup_guild_locked(
         self,
         guild,
@@ -550,9 +628,16 @@ class ActivityCog(commands.Cog):
     ) -> bool:
         if guild.id in self._startup_recovered_guild_ids:
             return True
+        text_state = await self._prepare_current_text_recovery_locked(
+            guild,
+            effective_at_epoch,
+        )
         close_reason = (
             "gateway_disconnect"
-            if guild.id in self._disconnect_epochs
+            if (
+                guild.id in self._disconnect_epochs
+                or guild.id in self._guild_unavailable_epochs
+            )
             else "restart_checkpoint"
         )
         recovered = await self._recover_suspended_guild_locked(
@@ -565,7 +650,9 @@ class ActivityCog(commands.Cog):
             return False
         self._startup_recovered_guild_ids.add(guild.id)
         self._disconnect_epochs.pop(guild.id, None)
-        await self._auto_backfill_current_channel_locked(guild, force=True)
+        self._guild_unavailable_epochs.pop(guild.id, None)
+        if not await self._finish_current_text_recovery_locked(guild, text_state):
+            self._schedule_text_sync_retry(guild)
         return True
 
     async def recover_after_ready(self) -> None:
@@ -620,6 +707,7 @@ class ActivityCog(commands.Cog):
                 )
 
     async def cog_load(self) -> None:
+        self._unloading = False
         if self.recovery_task is None or self.recovery_task.done():
             self.recovery_task = self._track_lifecycle_task(
                 asyncio.create_task(self.recover_after_ready())
@@ -630,14 +718,17 @@ class ActivityCog(commands.Cog):
             )
 
     async def cog_unload(self) -> None:
+        self._unloading = True
         tasks_to_wait = set(self._lifecycle_tasks)
         if self.checkpoint_loop.is_running():
             self.checkpoint_loop.cancel()
-        if self.recovery_task is not None and not self.recovery_task.done():
-            self.recovery_task.cancel()
+        for task in tasks_to_wait:
+            if not task.done():
+                task.cancel()
         if tasks_to_wait:
             await asyncio.gather(*tasks_to_wait, return_exceptions=True)
         self._lifecycle_tasks.difference_update(tasks_to_wait)
+        self._text_sync_retry_tasks.clear()
 
         guilds = list(self.bot.guilds)
         self._suspend_collection(guilds)
@@ -952,73 +1043,82 @@ class ActivityCog(commands.Cog):
                 channel=channel,
             )
 
-    async def _mark_current_text_sync_incomplete_locked(
+    async def _prepare_current_text_recovery_locked(
         self,
         guild,
         updated_epoch: int,
-    ) -> bool:
-        config = await self._store_call(self.store.get_config, guild.id)
-        channel_id = config.sod_eod_channel_id
-        if channel_id is None:
-            return False
-        await self._store_call(
-            self.store.mark_backfill_started,
-            guild.id,
-            channel_id,
-            updated_epoch,
-        )
-        return True
+    ):
+        try:
+            return await self._store_call(
+                self.store.begin_current_channel_recovery,
+                guild.id,
+                updated_epoch,
+            )
+        except Exception:
+            logger.exception(
+                "activity SoD/EoD recovery preparation failed for guild %s",
+                guild.id,
+            )
+            self._schedule_text_sync_retry(guild)
+            return _TEXT_RECOVERY_PREPARE_FAILED
 
-    async def _auto_backfill_current_channel_locked(
+    async def _finish_current_text_recovery_locked(
         self,
         guild,
-        *,
-        force: bool = False,
-    ) -> None:
+        state,
+    ) -> bool:
+        if state is _TEXT_RECOVERY_PREPARE_FAILED:
+            return False
+        if state is None or state.initialized_epoch is None:
+            return True
         try:
-            config = await self._store_call(self.store.get_config, guild.id)
-            channel_id = config.sod_eod_channel_id
-            if channel_id is None:
-                return
-            state = await self._store_call(
-                self.store.get_sync_state,
-                guild.id,
-                channel_id,
+            await self._backfill_current_channel_locked(
+                guild,
+                automatic_state=state,
             )
-            if not force and state is not None and state.completed_epoch is not None:
-                return
-            await self._backfill_current_channel_locked(guild)
+            return True
         except Exception:
             logger.exception(
                 "activity automatic SoD/EoD delta backfill failed for guild %s",
                 guild.id,
             )
+            return False
 
     async def _backfill_current_channel_locked(
         self,
         guild,
         *,
         channel: discord.TextChannel | None = None,
+        automatic_state=None,
     ) -> BackfillResult:
         config = await self._store_call(self.store.get_config, guild.id)
         channel_id = config.sod_eod_channel_id
         if channel_id is None:
             raise ValueError("SoD/EoD 채널이 설정되지 않았습니다.")
-        state = await self._store_call(
-            self.store.get_sync_state,
-            guild.id,
-            channel_id,
-        )
+        if automatic_state is None:
+            state = await self._store_call(
+                self.store.get_sync_state,
+                guild.id,
+                channel_id,
+            )
+            await self._store_call(
+                self.store.mark_backfill_started,
+                guild.id,
+                channel_id,
+                utc_now_epoch(),
+            )
+        else:
+            state = automatic_state
+            if state.channel_id != channel_id:
+                raise ChannelChanged(channel_id)
+            if state.initialized_epoch is None:
+                return BackfillResult(0, 0)
+            if state.newest_processed_message_id is None:
+                raise RuntimeError("initialized sync state has no delta cursor")
         after = (
             None
             if state is None or state.newest_processed_message_id is None
             else discord.Object(id=state.newest_processed_message_id)
-        )
-        await self._store_call(
-            self.store.mark_backfill_started,
-            guild.id,
-            channel_id,
-            utc_now_epoch(),
         )
         if channel is None:
             channel = guild.get_channel(channel_id)
@@ -1049,7 +1149,7 @@ class ActivityCog(commands.Cog):
                 except KeyError:
                     try:
                         member = await guild.fetch_member(author_id)
-                    except (discord.NotFound, discord.Forbidden):
+                    except discord.NotFound:
                         member = None
                     eligible_author = self._member_has_target_role(member, config)
                 author_eligibility[author_id] = eligible_author
@@ -1160,28 +1260,43 @@ class ActivityCog(commands.Cog):
             disconnect_epoch = self._disconnect_epochs[guild.id]
             try:
                 async with self.guild_locks[guild.id]:
-                    try:
-                        await self._mark_current_text_sync_incomplete_locked(
-                            guild,
-                            disconnect_epoch,
-                        )
-                    except Exception:
-                        logger.exception(
-                            "activity disconnect text sync invalidation failed "
-                            "for guild %s",
-                            guild.id,
-                        )
-                    await self._store_call(
-                        self.store.close_open_rows,
-                        guild.id,
+                    await self._prepare_current_text_recovery_locked(
+                        guild,
                         disconnect_epoch,
-                        "gateway_disconnect",
+                    )
+                    await self._close_for_outage_locked(
+                        guild,
+                        disconnect_epoch,
                     )
             except Exception:
                 logger.exception(
                     "activity disconnect close failed for guild %s",
                     guild.id,
                 )
+
+    @commands.Cog.listener()
+    async def on_guild_unavailable(self, guild) -> None:
+        observed_epoch = utc_now_epoch()
+        generation = self._suspend_collection((guild,))[guild.id]
+        self._guild_unavailable_epochs.setdefault(guild.id, observed_epoch)
+        outage_epoch = self._guild_unavailable_epochs[guild.id]
+        try:
+            async with self.guild_locks[guild.id]:
+                if self._collection_generations[guild.id] != generation:
+                    return
+                await self._prepare_current_text_recovery_locked(
+                    guild,
+                    outage_epoch,
+                )
+                await self._close_for_outage_locked(
+                    guild,
+                    outage_epoch,
+                )
+        except Exception:
+            logger.exception(
+                "activity guild-unavailable close failed for guild %s",
+                guild.id,
+            )
 
     @commands.Cog.listener()
     async def on_resumed(self) -> None:
@@ -1191,6 +1306,13 @@ class ActivityCog(commands.Cog):
         for guild in guilds:
             try:
                 async with self.guild_locks[guild.id]:
+                    if guild.id in self._guild_unavailable_epochs:
+                        await self._prepare_current_text_recovery_locked(
+                            guild,
+                            effective_at_epoch,
+                        )
+                        self._disconnect_epochs.pop(guild.id, None)
+                        continue
                     needs_startup_recovery = (
                         guild.id not in self._startup_recovered_guild_ids
                     )
@@ -1201,6 +1323,10 @@ class ActivityCog(commands.Cog):
                             generations[guild.id],
                         )
                     else:
+                        text_state = await self._prepare_current_text_recovery_locked(
+                            guild,
+                            effective_at_epoch,
+                        )
                         close_reason = (
                             "gateway_disconnect"
                             if guild.id in self._disconnect_epochs
@@ -1214,10 +1340,11 @@ class ActivityCog(commands.Cog):
                         )
                     if recovered and not needs_startup_recovery:
                         self._disconnect_epochs.pop(guild.id, None)
-                        await self._auto_backfill_current_channel_locked(
+                        if not await self._finish_current_text_recovery_locked(
                             guild,
-                            force=close_reason == "gateway_disconnect",
-                        )
+                            text_state,
+                        ):
+                            self._schedule_text_sync_retry(guild)
             except Exception:
                 logger.exception(
                     "activity resume recovery failed for guild %s",
@@ -1227,6 +1354,7 @@ class ActivityCog(commands.Cog):
     @commands.Cog.listener()
     async def on_guild_available(self, guild) -> None:
         had_pending_disconnect = guild.id in self._disconnect_epochs
+        had_guild_outage = guild.id in self._guild_unavailable_epochs
         needs_startup_recovery = (
             guild.id not in self._startup_recovered_guild_ids
         )
@@ -1242,37 +1370,35 @@ class ActivityCog(commands.Cog):
                         effective_at_epoch,
                         generation,
                     )
-                elif had_pending_disconnect:
-                    recovered = await self._recover_suspended_guild_locked(
-                        guild,
-                        effective_at_epoch,
-                        "gateway_disconnect",
-                        generation,
-                    )
                 else:
-                    await self._full_reconcile_guild_locked(
+                    text_state = await self._prepare_current_text_recovery_locked(
                         guild,
                         effective_at_epoch,
-                        expected_generation=generation,
                     )
-                    recovered = (
-                        self._collection_generations[guild.id] == generation
-                    )
-                if (
-                    recovered
-                    and had_pending_disconnect
-                    and not needs_startup_recovery
-                ):
-                    self._disconnect_epochs.pop(guild.id, None)
-                    await self._auto_backfill_current_channel_locked(
-                        guild,
-                        force=True,
-                    )
-                elif recovered and not needs_startup_recovery:
-                    await self._auto_backfill_current_channel_locked(
-                        guild,
-                        force=True,
-                    )
+                    if had_pending_disconnect or had_guild_outage:
+                        recovered = await self._recover_suspended_guild_locked(
+                            guild,
+                            effective_at_epoch,
+                            "gateway_disconnect",
+                            generation,
+                        )
+                    else:
+                        await self._full_reconcile_guild_locked(
+                            guild,
+                            effective_at_epoch,
+                            expected_generation=generation,
+                        )
+                        recovered = (
+                            self._collection_generations[guild.id] == generation
+                        )
+                    if recovered:
+                        self._disconnect_epochs.pop(guild.id, None)
+                        self._guild_unavailable_epochs.pop(guild.id, None)
+                        if not await self._finish_current_text_recovery_locked(
+                            guild,
+                            text_state,
+                        ):
+                            self._schedule_text_sync_retry(guild)
         except Exception:
             logger.exception(
                 "activity guild-available recovery failed for guild %s",

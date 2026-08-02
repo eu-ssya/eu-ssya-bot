@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 KST = timezone(timedelta(hours=9), "KST")
+DISCORD_EPOCH_MILLISECONDS = 1_420_070_400_000
 _UNSET = object()
 _SNAPSHOT_ROW_TABLES = {
     "voice_sessions": "closed_reason",
@@ -42,6 +43,12 @@ def session_overlap_seconds(
         0,
         min(effective_end, range_end) - max(started_epoch, range_start),
     )
+
+
+def discord_snowflake_floor_for_epoch(epoch: int) -> int:
+    _require_integer_epochs(epoch=epoch)
+    milliseconds = max(epoch * 1000, DISCORD_EPOCH_MILLISECONDS)
+    return max(1, (milliseconds - DISCORD_EPOCH_MILLISECONDS) << 22)
 
 
 @dataclass(frozen=True)
@@ -112,6 +119,7 @@ class ActivitySyncState:
     newest_processed_message_created_epoch: int | None
     history_from_epoch: int | None
     completed_epoch: int | None
+    initialized_epoch: int | None
     updated_epoch: int
 
 
@@ -125,7 +133,7 @@ CREATE TABLE IF NOT EXISTS voice_sessions (id INTEGER PRIMARY KEY,guild_id INTEG
 CREATE TABLE IF NOT EXISTS voice_collection_runs (id INTEGER PRIMARY KEY,guild_id INTEGER NOT NULL,started_epoch INTEGER NOT NULL,last_checkpoint_epoch INTEGER NOT NULL,ended_epoch INTEGER,ended_reason TEXT CHECK(ended_reason IN ('config_changed','config_invalid','graceful_shutdown','gateway_disconnect','restart_checkpoint')),CHECK(typeof(started_epoch)='integer'),CHECK(typeof(last_checkpoint_epoch)='integer'),CHECK(ended_epoch IS NULL OR typeof(ended_epoch)='integer'),CHECK(last_checkpoint_epoch >= started_epoch),CHECK((ended_epoch IS NULL AND ended_reason IS NULL) OR (ended_epoch IS NOT NULL AND ended_reason IS NOT NULL)),CHECK(ended_epoch IS NULL OR ended_epoch >= last_checkpoint_epoch));
 CREATE TABLE IF NOT EXISTS sod_eod_events (message_id INTEGER NOT NULL,guild_id INTEGER NOT NULL,user_id INTEGER NOT NULL,event_date_kst TEXT NOT NULL,event_type TEXT NOT NULL CHECK(event_type IN ('sod','eod')),message_created_epoch INTEGER NOT NULL CHECK(typeof(message_created_epoch)='integer'),channel_id INTEGER NOT NULL,PRIMARY KEY(message_id,event_type));
 CREATE TABLE IF NOT EXISTS sod_eod_daily (guild_id INTEGER NOT NULL,user_id INTEGER NOT NULL,event_date_kst TEXT NOT NULL,event_type TEXT NOT NULL CHECK(event_type IN ('sod','eod')),PRIMARY KEY(guild_id,user_id,event_date_kst,event_type));
-CREATE TABLE IF NOT EXISTS activity_sync_state (guild_id INTEGER NOT NULL,channel_id INTEGER NOT NULL,newest_processed_message_id INTEGER,newest_processed_message_created_epoch INTEGER CHECK(newest_processed_message_created_epoch IS NULL OR typeof(newest_processed_message_created_epoch)='integer'),history_from_epoch INTEGER CHECK(history_from_epoch IS NULL OR typeof(history_from_epoch)='integer'),completed_epoch INTEGER CHECK(completed_epoch IS NULL OR typeof(completed_epoch)='integer'),updated_epoch INTEGER NOT NULL CHECK(typeof(updated_epoch)='integer'),PRIMARY KEY(guild_id,channel_id));
+CREATE TABLE IF NOT EXISTS activity_sync_state (guild_id INTEGER NOT NULL,channel_id INTEGER NOT NULL,newest_processed_message_id INTEGER,newest_processed_message_created_epoch INTEGER CHECK(newest_processed_message_created_epoch IS NULL OR typeof(newest_processed_message_created_epoch)='integer'),history_from_epoch INTEGER CHECK(history_from_epoch IS NULL OR typeof(history_from_epoch)='integer'),completed_epoch INTEGER CHECK(completed_epoch IS NULL OR typeof(completed_epoch)='integer'),initialized_epoch INTEGER CHECK(initialized_epoch IS NULL OR typeof(initialized_epoch)='integer'),updated_epoch INTEGER NOT NULL CHECK(typeof(updated_epoch)='integer'),PRIMARY KEY(guild_id,channel_id));
 CREATE TABLE IF NOT EXISTS sod_eod_channel_periods (id INTEGER PRIMARY KEY,guild_id INTEGER NOT NULL,channel_id INTEGER NOT NULL,started_epoch INTEGER NOT NULL CHECK(typeof(started_epoch)='integer'),ended_epoch INTEGER CHECK(ended_epoch IS NULL OR typeof(ended_epoch)='integer'),ended_reason TEXT CHECK(ended_reason IN ('channel_changed','config_invalid')),CHECK((ended_epoch IS NULL AND ended_reason IS NULL) OR (ended_epoch IS NOT NULL AND ended_reason IS NOT NULL)),CHECK(ended_epoch IS NULL OR ended_epoch >= started_epoch));
 CREATE UNIQUE INDEX IF NOT EXISTS idx_voice_sessions_one_open_per_member ON voice_sessions(guild_id,user_id) WHERE ended_epoch IS NULL;
 CREATE INDEX IF NOT EXISTS idx_voice_sessions_report ON voice_sessions(guild_id,user_id,activity_kind,started_epoch,ended_epoch);
@@ -154,6 +162,7 @@ class ActivityStore:
         with closing(self._connect()) as conn:
             conn.executescript(SCHEMA_SQL)
             self._migrate_epoch_constraints(conn)
+            self._migrate_sync_initialization(conn)
             conn.commit()
 
     @staticmethod
@@ -285,6 +294,75 @@ class ActivityStore:
                     )
                     """
                 )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    @staticmethod
+    def _migrate_sync_initialization(conn) -> None:
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(activity_sync_state)")
+        }
+        if "initialized_epoch" not in columns:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    """
+                    ALTER TABLE activity_sync_state
+                    ADD COLUMN initialized_epoch INTEGER CHECK(
+                        initialized_epoch IS NULL OR
+                        typeof(initialized_epoch)='integer'
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    UPDATE activity_sync_state
+                    SET initialized_epoch=COALESCE(
+                        completed_epoch,
+                        updated_epoch
+                    )
+                    WHERE completed_epoch IS NOT NULL
+                       OR newest_processed_message_id IS NOT NULL
+                    """
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        cursorless_initialized = conn.execute(
+            """
+            SELECT guild_id, channel_id, initialized_epoch
+            FROM activity_sync_state
+            WHERE initialized_epoch IS NOT NULL
+              AND newest_processed_message_id IS NULL
+            """
+        ).fetchall()
+        if not cursorless_initialized:
+            return
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.executemany(
+                """
+                UPDATE activity_sync_state
+                SET newest_processed_message_id=?,
+                    newest_processed_message_created_epoch=?
+                WHERE guild_id=? AND channel_id=?
+                  AND newest_processed_message_id IS NULL
+                """,
+                [
+                    (
+                        discord_snowflake_floor_for_epoch(initialized_epoch),
+                        initialized_epoch,
+                        guild_id,
+                        channel_id,
+                    )
+                    for guild_id, channel_id, initialized_epoch
+                    in cursorless_initialized
+                ],
+            )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -1257,13 +1335,62 @@ class ActivityStore:
                 """
                 SELECT guild_id, channel_id, newest_processed_message_id,
                        newest_processed_message_created_epoch, history_from_epoch,
-                       completed_epoch, updated_epoch
+                       completed_epoch, initialized_epoch, updated_epoch
                 FROM activity_sync_state
                 WHERE guild_id=? AND channel_id=?
                 """,
                 (guild_id, channel_id),
             ).fetchone()
         return None if row is None else ActivitySyncState(*row)
+
+    def begin_current_channel_recovery(
+        self,
+        guild_id: int,
+        updated_epoch: int,
+    ) -> ActivitySyncState | None:
+        _require_integer_epochs(updated_epoch=updated_epoch)
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    """
+                    SELECT sod_eod_channel_id
+                    FROM activity_config
+                    WHERE guild_id=?
+                    """,
+                    (guild_id,),
+                ).fetchone()
+                channel_id = None if row is None else row[0]
+                if channel_id is None:
+                    conn.commit()
+                    return None
+                conn.execute(
+                    """
+                    INSERT INTO activity_sync_state(
+                        guild_id, channel_id, completed_epoch, updated_epoch
+                    ) VALUES (?, ?, NULL, ?)
+                    ON CONFLICT(guild_id, channel_id) DO UPDATE SET
+                        completed_epoch=NULL,
+                        updated_epoch=excluded.updated_epoch
+                    """,
+                    (guild_id, channel_id, updated_epoch),
+                )
+                prepared = conn.execute(
+                    """
+                    SELECT guild_id, channel_id, newest_processed_message_id,
+                           newest_processed_message_created_epoch,
+                           history_from_epoch, completed_epoch,
+                           initialized_epoch, updated_epoch
+                    FROM activity_sync_state
+                    WHERE guild_id=? AND channel_id=?
+                    """,
+                    (guild_id, channel_id),
+                ).fetchone()
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return ActivitySyncState(*prepared)
 
     def mark_backfill_started(
         self, guild_id: int, channel_id: int, updated_epoch: int
@@ -1295,16 +1422,39 @@ class ActivityStore:
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                empty_marker = discord_snowflake_floor_for_epoch(completed_epoch)
                 conn.execute(
                     """
                     INSERT INTO activity_sync_state(
-                        guild_id, channel_id, completed_epoch, updated_epoch
-                    ) VALUES (?, ?, ?, ?)
+                        guild_id, channel_id, newest_processed_message_id,
+                        newest_processed_message_created_epoch,
+                        completed_epoch, initialized_epoch, updated_epoch
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(guild_id, channel_id) DO UPDATE SET
+                        newest_processed_message_id=COALESCE(
+                            activity_sync_state.newest_processed_message_id,
+                            excluded.newest_processed_message_id
+                        ),
+                        newest_processed_message_created_epoch=COALESCE(
+                            activity_sync_state.newest_processed_message_created_epoch,
+                            excluded.newest_processed_message_created_epoch
+                        ),
                         completed_epoch=excluded.completed_epoch,
+                        initialized_epoch=COALESCE(
+                            activity_sync_state.initialized_epoch,
+                            excluded.initialized_epoch
+                        ),
                         updated_epoch=excluded.updated_epoch
                     """,
-                    (guild_id, channel_id, completed_epoch, completed_epoch),
+                    (
+                        guild_id,
+                        channel_id,
+                        empty_marker,
+                        completed_epoch,
+                        completed_epoch,
+                        completed_epoch,
+                        completed_epoch,
+                    ),
                 )
                 conn.commit()
             except Exception:
