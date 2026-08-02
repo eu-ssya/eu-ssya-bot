@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import sqlite3
+import unicodedata
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -82,6 +83,126 @@ def _clean_display_name(value: str, limit: int) -> str:
     if len(cleaned) <= limit:
         return cleaned
     return cleaned[: max(1, limit - 1)] + "…"
+
+
+def _is_zero_width_extension(character: str) -> bool:
+    codepoint = ord(character)
+    return bool(
+        character == "\u200d"
+        or unicodedata.combining(character)
+        or 0xFE00 <= codepoint <= 0xFE0F
+        or 0xE0100 <= codepoint <= 0xE01EF
+        or 0x1F3FB <= codepoint <= 0x1F3FF
+    )
+
+
+def _terminal_clusters(value: str) -> list[str]:
+    clusters: list[str] = []
+    for character in value:
+        if (
+            not clusters
+            or (
+                not _is_zero_width_extension(character)
+                and not clusters[-1].endswith("\u200d")
+            )
+        ):
+            clusters.append(character)
+        else:
+            clusters[-1] += character
+    return clusters
+
+
+def _cluster_cell_width(cluster: str) -> int:
+    for character in cluster:
+        if _is_zero_width_extension(character):
+            continue
+        codepoint = ord(character)
+        if (
+            unicodedata.east_asian_width(character) in {"W", "F"}
+            or 0x2600 <= codepoint <= 0x27BF
+            or 0x1F000 <= codepoint <= 0x1FAFF
+        ):
+            return 2
+        return 1
+    return 0
+
+
+def _terminal_cell_width(value: str) -> int:
+    return sum(_cluster_cell_width(cluster) for cluster in _terminal_clusters(value))
+
+
+def _fit_terminal_cell(
+    value: str,
+    width: int,
+    *,
+    align: str = "left",
+) -> str:
+    if align not in {"left", "right"}:
+        raise ValueError("align must be 'left' or 'right'")
+    if width < 3:
+        raise ValueError("terminal cell width must be at least 3")
+
+    normalized = " ".join(str(value).split())
+    clusters = _terminal_clusters(normalized)
+    rendered = normalized
+    rendered_width = _terminal_cell_width(rendered)
+    if rendered_width > width:
+        kept: list[str] = []
+        kept_width = 0
+        for cluster in clusters:
+            cluster_width = _cluster_cell_width(cluster)
+            if kept_width + cluster_width + 3 > width:
+                break
+            kept.append(cluster)
+            kept_width += cluster_width
+        rendered = "".join(kept) + "..."
+        rendered_width = kept_width + 3
+
+    padding = " " * (width - rendered_width)
+    return padding + rendered if align == "right" else rendered + padding
+
+
+_WARNING_EPOCH_RANGE = re.compile(r"(?P<start>\d+)~(?P<end>\d+) UTC epoch")
+_WARNING_EPOCH_POINT = re.compile(r"(?P<epoch>\d+) UTC epoch")
+
+
+def _format_kst_minute(epoch: int) -> str:
+    return datetime.fromtimestamp(epoch, KST).strftime("%Y-%m-%d %H:%M KST")
+
+
+def _format_recent_activity(epoch: int | None) -> str:
+    if epoch is None:
+        return "없음"
+    try:
+        return datetime.fromtimestamp(epoch, KST).strftime("%Y-%m-%d %H:%M")
+    except (OverflowError, OSError, ValueError):
+        return "표시 불가"
+
+
+def _format_duration(seconds: int) -> str:
+    total_minutes = max(0, int(seconds)) // 60
+    hours, minutes = divmod(total_minutes, 60)
+    if hours == 0:
+        return f"{minutes}분"
+    return f"{hours}시간 {minutes}분"
+
+
+def _humanize_warning(warning: CoverageWarning) -> str:
+    text = " ".join(str(warning.text).split())
+    text = _WARNING_EPOCH_RANGE.sub(
+        lambda match: (
+            f"{_format_kst_minute(int(match.group('start')))} ~ "
+            f"{_format_kst_minute(int(match.group('end')))}"
+        ),
+        text,
+    )
+    text = _WARNING_EPOCH_POINT.sub(
+        lambda match: _format_kst_minute(int(match.group("epoch"))),
+        text,
+    )
+    if warning.code == "voice_gap":
+        text = text.replace("음성 수집 누락 구간", "음성 수집 공백")
+    return text
 
 
 def _format_timestamp(epoch: int | None, target_timezone) -> str:

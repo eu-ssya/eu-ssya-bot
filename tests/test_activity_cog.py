@@ -3615,6 +3615,84 @@ class SodEodCollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("on_message_delete", listener_names)
 
 
+class ActivityReportFormattingTests(unittest.TestCase):
+    def test_terminal_cell_width_handles_korean_ascii_emoji_and_combining_text(self):
+        from activity_cog import _fit_terminal_cell, _terminal_cell_width
+
+        for value in ("Alice", "홍길동", "👩🏽‍💻", "e\u0301"):
+            with self.subTest(value=value):
+                fitted = _fit_terminal_cell(value, 14)
+                self.assertEqual(_terminal_cell_width(fitted), 14)
+
+        truncated = _fit_terminal_cell("가나다라마바사아", 14)
+        self.assertEqual(_terminal_cell_width(truncated), 14)
+        self.assertTrue(truncated.rstrip().endswith("..."))
+        self.assertNotIn("아", truncated)
+
+    def test_terminal_cell_alignment_uses_cell_width_not_python_length(self):
+        from activity_cog import _fit_terminal_cell
+
+        self.assertEqual(_fit_terminal_cell("한글", 6), "한글  ")
+        self.assertEqual(_fit_terminal_cell("12", 4, align="right"), "  12")
+
+    def test_recent_activity_and_duration_are_human_readable(self):
+        from activity_cog import _format_duration, _format_recent_activity
+
+        epoch = int(datetime.datetime(2026, 8, 3, 23, 24, tzinfo=KST).timestamp())
+        self.assertEqual(_format_recent_activity(epoch), "2026-08-03 23:24")
+        self.assertEqual(_format_recent_activity(None), "없음")
+
+        cases = {
+            0: "0분",
+            59: "0분",
+            60: "1분",
+            45 * 60 + 59: "45분",
+            65 * 60 + 59: "1시간 5분",
+            12 * 3600 + 30 * 60 + 59: "12시간 30분",
+        }
+        for seconds, expected in cases.items():
+            with self.subTest(seconds=seconds):
+                self.assertEqual(_format_duration(seconds), expected)
+
+    def test_warning_epochs_are_replaced_with_kst_text(self):
+        from activity_cog import _humanize_warning
+
+        gap_start = int(
+            datetime.datetime(2026, 8, 1, 3, 0, tzinfo=KST).timestamp()
+        )
+        gap_end = int(
+            datetime.datetime(2026, 8, 1, 5, 10, tzinfo=KST).timestamp()
+        )
+        warning = CoverageWarning(
+            code="voice_gap",
+            text=(
+                f"음성 수집 누락 구간: {gap_start}~{gap_end} UTC epoch. "
+                "이 구간의 값은 부분 데이터입니다."
+            ),
+        )
+
+        rendered = _humanize_warning(warning)
+
+        self.assertEqual(
+            rendered,
+            "음성 수집 공백: 2026-08-01 03:00 KST ~ "
+            "2026-08-01 05:10 KST. 이 구간의 값은 부분 데이터입니다.",
+        )
+        self.assertNotIn(str(gap_start), rendered)
+        self.assertNotIn("UTC epoch", rendered)
+
+        single = _humanize_warning(
+            CoverageWarning(
+                code="sod_history_partial",
+                text=f"접근 가능한 이력은 {gap_start} UTC epoch부터입니다.",
+            )
+        )
+        self.assertEqual(
+            single,
+            "접근 가능한 이력은 2026-08-01 03:00 KST부터입니다.",
+        )
+
+
 class ActivityReportViewTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def row(index=1, *, display_name="Member", last_activity_epoch=100):
