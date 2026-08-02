@@ -6,7 +6,12 @@ from datetime import date
 from pathlib import Path
 from unittest import mock
 
-from activity_store import ActivityStore, kst_day_for_epoch, kst_range_to_epoch
+from activity_store import (
+    ActivityConfig,
+    ActivityStore,
+    kst_day_for_epoch,
+    kst_range_to_epoch,
+)
 
 
 class SchemaTests(unittest.TestCase):
@@ -90,6 +95,26 @@ class ConfigurationTests(unittest.TestCase):
         config = self.store.get_config(1)
         self.assertEqual(config.target_role_id, 10)
         self.assertIsNone(config.reading_category_id)
+
+    def test_config_apis_reject_fractional_effective_epochs(self):
+        operations = [
+            lambda: self.store.apply_config_change(
+                1, target_role_id=10, effective_at_epoch=100.5
+            ),
+            lambda: self.store.invalidate_sod_eod_channel(
+                1, effective_at_epoch=100.5
+            ),
+        ]
+
+        for operation in operations:
+            with self.subTest(operation=operation):
+                with self.assertRaises(TypeError):
+                    operation()
+
+        self.assertEqual(
+            self.store.get_config(1),
+            ActivityConfig(1, None, None, None, None, None),
+        )
 
     def test_channel_period_a_b_a(self):
         self.store.apply_config_change(1, sod_eod_channel_id=40, effective_at_epoch=100)
@@ -228,6 +253,100 @@ class VoiceSessionTests(unittest.TestCase):
             self.store.voice_seconds_for_range(1, 2, "study", 170, 200), 30
         )
 
+    def test_voice_count_includes_only_positive_overlap_sessions(self):
+        self.store.reconcile_session(1, 2, "study", 100)
+        self.store.reconcile_session(1, 2, None, 120, close_reason="normal")
+        self.store.reconcile_session(1, 2, "study", 120)
+        self.store.reconcile_session(1, 2, None, 140, close_reason="normal")
+
+        self.assertEqual(
+            self.store.voice_session_count_for_range(1, 2, "study", 120, 130),
+            1,
+        )
+
+    def test_voice_apis_reject_fractional_epochs(self):
+        cases = [
+            (
+                "reconcile effective_at_epoch",
+                lambda store: store.reconcile_session(1, 2, "study", 100.5),
+            ),
+            (
+                "collection run started_epoch",
+                lambda store: store.open_collection_run(1, 100.5),
+            ),
+            (
+                "close effective_at_epoch",
+                lambda store: store.close_open_rows(
+                    1, 100.5, "gateway_disconnect"
+                ),
+            ),
+            (
+                "checkpoint_epoch",
+                lambda store: store.checkpoint_open_rows(1, 100.5),
+            ),
+            (
+                "seconds range_start",
+                lambda store: store.voice_seconds_for_range(
+                    1, 2, "study", 0.5, 100
+                ),
+            ),
+            (
+                "seconds range_end",
+                lambda store: store.voice_seconds_for_range(
+                    1, 2, "study", 0, 100.5
+                ),
+            ),
+            (
+                "count range_start",
+                lambda store: store.voice_session_count_for_range(
+                    1, 2, "study", 0.5, 100
+                ),
+            ),
+            (
+                "count range_end",
+                lambda store: store.voice_session_count_for_range(
+                    1, 2, "study", 0, 100.5
+                ),
+            ),
+            (
+                "coverage range_start",
+                lambda store: store.voice_coverage_for_range(1, 0.5, 100),
+            ),
+            (
+                "coverage range_end",
+                lambda store: store.voice_coverage_for_range(1, 0, 100.5),
+            ),
+        ]
+
+        for label, operation in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                store = ActivityStore(str(Path(tmp) / "activity.db"))
+                store.initialize()
+                with self.assertRaises(TypeError):
+                    operation(store)
+
+    def test_voice_schema_rejects_fractional_epochs(self):
+        statements = [
+            """
+            INSERT INTO voice_sessions(
+                guild_id, user_id, activity_kind, started_epoch,
+                last_checkpoint_epoch
+            ) VALUES (1, 2, 'study', 100.5, 101)
+            """,
+            """
+            INSERT INTO voice_collection_runs(
+                guild_id, started_epoch, last_checkpoint_epoch
+            ) VALUES (1, 100.5, 101)
+            """,
+        ]
+
+        for statement in statements:
+            with self.subTest(table=statement.split()[2]), closing(
+                self.store._connect()
+            ) as conn:
+                with self.assertRaises(sqlite3.IntegrityError):
+                    conn.execute(statement)
+
     def test_disconnect_creates_exact_gap(self):
         self.store.open_collection_run(1, 100)
         self.store.close_open_rows(1, 160, "gateway_disconnect")
@@ -236,6 +355,40 @@ class VoiceSessionTests(unittest.TestCase):
         self.assertEqual(
             self.store.voice_coverage_for_range(1, 100, 240).gaps,
             [(160, 200)],
+        )
+
+    def test_coverage_merges_overlapping_and_adjacent_runs(self):
+        with closing(self.store._connect()) as conn:
+            conn.executemany(
+                """
+                INSERT INTO voice_collection_runs(
+                    guild_id, started_epoch, last_checkpoint_epoch,
+                    ended_epoch, ended_reason
+                ) VALUES (1, ?, ?, ?, 'gateway_disconnect')
+                """,
+                [(90, 90, 150), (140, 140, 180), (180, 180, 210)],
+            )
+            conn.commit()
+
+        coverage = self.store.voice_coverage_for_range(1, 100, 200)
+
+        self.assertEqual(coverage.covered, [(100, 200)])
+        self.assertEqual(coverage.gaps, [])
+
+    def test_open_rows_use_query_end_not_later_checkpoint(self):
+        self.store.reconcile_session(1, 2, "study", 100)
+        self.store.open_collection_run(1, 100)
+        self.store.checkpoint_open_rows(1, 300)
+
+        self.assertEqual(
+            self.store.voice_seconds_for_range(1, 2, "study", 0, 200), 100
+        )
+        self.assertEqual(
+            self.store.voice_session_count_for_range(1, 2, "study", 0, 200), 1
+        )
+        self.assertEqual(
+            self.store.voice_coverage_for_range(1, 0, 200).covered,
+            [(100, 200)],
         )
 
     def test_open_session_unique_race_rechecks_after_injected_duplicate(self):
@@ -269,6 +422,10 @@ class VoiceSessionTests(unittest.TestCase):
             self.store.reconcile_session(1, 2, "study", 100)
 
         self.assertEqual(self.store.open_session_count(1, 2), 1)
+        self.assertEqual(
+            self.store.list_sessions(1, 2),
+            [("study", 90, None, None)],
+        )
 
     def test_unique_race_different_kind_transitions_and_check_error_reraises(self):
         with closing(self.store._connect()) as conn:

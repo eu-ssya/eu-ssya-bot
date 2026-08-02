@@ -10,6 +10,12 @@ KST = timezone(timedelta(hours=9), "KST")
 _UNSET = object()
 
 
+def _require_integer_epochs(**epochs: int) -> None:
+    for name, value in epochs.items():
+        if type(value) is not int:
+            raise TypeError(f"{name} must be integer epoch seconds")
+
+
 def kst_day_for_epoch(epoch: int) -> str:
     return datetime.fromtimestamp(epoch, KST).date().isoformat()
 
@@ -48,8 +54,8 @@ class CoverageSummary:
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS activity_config (guild_id INTEGER PRIMARY KEY,target_role_id INTEGER,reading_category_id INTEGER,study_category_id INTEGER,sod_eod_channel_id INTEGER,voice_collection_started_epoch INTEGER,created_epoch INTEGER NOT NULL,updated_epoch INTEGER NOT NULL,CHECK(reading_category_id IS NULL OR study_category_id IS NULL OR reading_category_id <> study_category_id));
-CREATE TABLE IF NOT EXISTS voice_sessions (id INTEGER PRIMARY KEY,guild_id INTEGER NOT NULL,user_id INTEGER NOT NULL,activity_kind TEXT NOT NULL CHECK(activity_kind IN ('reading_room','study')),started_epoch INTEGER NOT NULL,last_checkpoint_epoch INTEGER NOT NULL,ended_epoch INTEGER,closed_reason TEXT CHECK(closed_reason IN ('normal','category_change','role_removed','config_changed','reconciled','gateway_disconnect','restart_checkpoint')),CHECK(last_checkpoint_epoch >= started_epoch),CHECK((ended_epoch IS NULL AND closed_reason IS NULL) OR (ended_epoch IS NOT NULL AND closed_reason IS NOT NULL)),CHECK(ended_epoch IS NULL OR ended_epoch >= last_checkpoint_epoch));
-CREATE TABLE IF NOT EXISTS voice_collection_runs (id INTEGER PRIMARY KEY,guild_id INTEGER NOT NULL,started_epoch INTEGER NOT NULL,last_checkpoint_epoch INTEGER NOT NULL,ended_epoch INTEGER,ended_reason TEXT CHECK(ended_reason IN ('config_changed','config_invalid','graceful_shutdown','gateway_disconnect','restart_checkpoint')),CHECK(last_checkpoint_epoch >= started_epoch),CHECK((ended_epoch IS NULL AND ended_reason IS NULL) OR (ended_epoch IS NOT NULL AND ended_reason IS NOT NULL)),CHECK(ended_epoch IS NULL OR ended_epoch >= last_checkpoint_epoch));
+CREATE TABLE IF NOT EXISTS voice_sessions (id INTEGER PRIMARY KEY,guild_id INTEGER NOT NULL,user_id INTEGER NOT NULL,activity_kind TEXT NOT NULL CHECK(activity_kind IN ('reading_room','study')),started_epoch INTEGER NOT NULL,last_checkpoint_epoch INTEGER NOT NULL,ended_epoch INTEGER,closed_reason TEXT CHECK(closed_reason IN ('normal','category_change','role_removed','config_changed','reconciled','gateway_disconnect','restart_checkpoint')),CHECK(typeof(started_epoch)='integer'),CHECK(typeof(last_checkpoint_epoch)='integer'),CHECK(ended_epoch IS NULL OR typeof(ended_epoch)='integer'),CHECK(last_checkpoint_epoch >= started_epoch),CHECK((ended_epoch IS NULL AND closed_reason IS NULL) OR (ended_epoch IS NOT NULL AND closed_reason IS NOT NULL)),CHECK(ended_epoch IS NULL OR ended_epoch >= last_checkpoint_epoch));
+CREATE TABLE IF NOT EXISTS voice_collection_runs (id INTEGER PRIMARY KEY,guild_id INTEGER NOT NULL,started_epoch INTEGER NOT NULL,last_checkpoint_epoch INTEGER NOT NULL,ended_epoch INTEGER,ended_reason TEXT CHECK(ended_reason IN ('config_changed','config_invalid','graceful_shutdown','gateway_disconnect','restart_checkpoint')),CHECK(typeof(started_epoch)='integer'),CHECK(typeof(last_checkpoint_epoch)='integer'),CHECK(ended_epoch IS NULL OR typeof(ended_epoch)='integer'),CHECK(last_checkpoint_epoch >= started_epoch),CHECK((ended_epoch IS NULL AND ended_reason IS NULL) OR (ended_epoch IS NOT NULL AND ended_reason IS NOT NULL)),CHECK(ended_epoch IS NULL OR ended_epoch >= last_checkpoint_epoch));
 CREATE TABLE IF NOT EXISTS sod_eod_events (message_id INTEGER NOT NULL,guild_id INTEGER NOT NULL,user_id INTEGER NOT NULL,event_date_kst TEXT NOT NULL,event_type TEXT NOT NULL CHECK(event_type IN ('sod','eod')),message_created_epoch INTEGER NOT NULL,channel_id INTEGER NOT NULL,PRIMARY KEY(message_id,event_type));
 CREATE TABLE IF NOT EXISTS sod_eod_daily (guild_id INTEGER NOT NULL,user_id INTEGER NOT NULL,event_date_kst TEXT NOT NULL,event_type TEXT NOT NULL CHECK(event_type IN ('sod','eod')),PRIMARY KEY(guild_id,user_id,event_date_kst,event_type));
 CREATE TABLE IF NOT EXISTS activity_sync_state (guild_id INTEGER NOT NULL,channel_id INTEGER NOT NULL,newest_processed_message_id INTEGER,newest_processed_message_created_epoch INTEGER,history_from_epoch INTEGER,completed_epoch INTEGER,updated_epoch INTEGER NOT NULL,PRIMARY KEY(guild_id,channel_id));
@@ -102,6 +108,7 @@ class ActivityStore:
         study_category_id: int | None | object = _UNSET,
         sod_eod_channel_id: int | None | object = _UNSET,
     ) -> ActivityConfig:
+        _require_integer_epochs(effective_at_epoch=effective_at_epoch)
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -162,6 +169,7 @@ class ActivityStore:
         effective_at_epoch: int,
         close_reason: str = "reconciled",
     ) -> None:
+        _require_integer_epochs(effective_at_epoch=effective_at_epoch)
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -217,6 +225,7 @@ class ActivityStore:
                 raise
 
     def open_collection_run(self, guild_id: int, started_epoch: int) -> None:
+        _require_integer_epochs(started_epoch=started_epoch)
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -245,6 +254,7 @@ class ActivityStore:
     def close_open_rows(
         self, guild_id: int, effective_at_epoch: int, reason: str
     ) -> None:
+        _require_integer_epochs(effective_at_epoch=effective_at_epoch)
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -257,6 +267,7 @@ class ActivityStore:
                 raise
 
     def checkpoint_open_rows(self, guild_id: int, checkpoint_epoch: int) -> None:
+        _require_integer_epochs(checkpoint_epoch=checkpoint_epoch)
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -289,6 +300,7 @@ class ActivityStore:
         range_start: int,
         range_end: int,
     ) -> int:
+        _require_integer_epochs(range_start=range_start, range_end=range_end)
         if range_end <= range_start:
             return 0
         with closing(self._connect()) as conn:
@@ -321,9 +333,43 @@ class ActivityStore:
             ).fetchone()
         return int(row[0])
 
+    def voice_session_count_for_range(
+        self,
+        guild_id: int,
+        user_id: int,
+        activity_kind: str,
+        range_start: int,
+        range_end: int,
+    ) -> int:
+        _require_integer_epochs(range_start=range_start, range_end=range_end)
+        if range_end <= range_start:
+            return 0
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM voice_sessions
+                WHERE guild_id=?
+                  AND user_id=?
+                  AND activity_kind=?
+                  AND MIN(COALESCE(ended_epoch, ?), ?)
+                      - MAX(started_epoch, ?) > 0
+                """,
+                (
+                    guild_id,
+                    user_id,
+                    activity_kind,
+                    range_end,
+                    range_end,
+                    range_start,
+                ),
+            ).fetchone()
+        return int(row[0])
+
     def voice_coverage_for_range(
         self, guild_id: int, range_start: int, range_end: int
     ) -> CoverageSummary:
+        _require_integer_epochs(range_start=range_start, range_end=range_end)
         if range_end <= range_start:
             return CoverageSummary([], [])
         with closing(self._connect()) as conn:
@@ -408,6 +454,7 @@ class ActivityStore:
     def invalidate_sod_eod_channel(
         self, guild_id: int, *, effective_at_epoch: int
     ) -> ActivityConfig:
+        _require_integer_epochs(effective_at_epoch=effective_at_epoch)
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
