@@ -2,17 +2,33 @@ import asyncio
 import io
 import logging
 import os
+import re
+import sqlite3
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from activity_store import ActivityStore
+from activity_store import ActivityStore, ChannelChanged
 
 
 logger = logging.getLogger(__name__)
+
+
+SOD_EOD_PATTERN = re.compile(r"(?<![a-z0-9])(sod|eod)(?![a-z0-9])")
+
+
+def detect_sod_eod(content: str) -> set[str]:
+    return {match.group(1) for match in SOD_EOD_PATTERN.finditer(content.casefold())}
+
+
+@dataclass(frozen=True)
+class BackfillResult:
+    processed_count: int
+    event_count: int
 
 
 def utc_now_epoch() -> int:
@@ -250,6 +266,29 @@ class ActivityCog(commands.Cog):
         )
 
     @staticmethod
+    def _member_has_target_role(member, config) -> bool:
+        return bool(
+            member is not None
+            and not member.bot
+            and config.target_role_id
+            in {getattr(role, "id", None) for role in member.roles}
+        )
+
+    @classmethod
+    def _message_is_eligible(cls, message, guild, config, member) -> bool:
+        message_guild = getattr(message, "guild", None)
+        channel = getattr(message, "channel", None)
+        return bool(
+            message_guild is not None
+            and getattr(message_guild, "id", None) == guild.id
+            and isinstance(channel, discord.TextChannel)
+            and getattr(channel, "id", None) == config.sod_eod_channel_id
+            and getattr(message, "type", None) is discord.MessageType.default
+            and getattr(message, "webhook_id", None) is None
+            and cls._member_has_target_role(member, config)
+        )
+
+    @staticmethod
     def desired_kind_for_member(member, config) -> str | None:
         role_ids = {getattr(role, "id", None) for role in member.roles}
         if member.bot or config.target_role_id not in role_ids:
@@ -426,6 +465,127 @@ class ActivityCog(commands.Cog):
                 sod_eod_channel_id=channel_id,
                 effective_at_epoch=now_epoch,
             )
+
+    @commands.Cog.listener()
+    async def on_message(self, message) -> None:
+        guild = getattr(message, "guild", None)
+        if guild is None:
+            return
+        try:
+            config = await self._store_call(self.store.get_config, guild.id)
+            author = getattr(message, "author", None)
+            author_id = getattr(author, "id", None)
+            member = None if author_id is None else guild.get_member(author_id)
+            if not self._message_is_eligible(message, guild, config, member):
+                return
+            event_types = detect_sod_eod(message.content)
+            if not event_types:
+                return
+            message_created_epoch = int(message.created_at.timestamp())
+            await self._store_call(
+                self.store.record_live_message,
+                guild_id=guild.id,
+                channel_id=message.channel.id,
+                message_id=message.id,
+                user_id=member.id,
+                message_created_epoch=message_created_epoch,
+                event_types=event_types,
+                updated_epoch=utc_now_epoch(),
+                expected_current_channel_id=config.sod_eod_channel_id,
+            )
+        except Exception:
+            logger.exception(
+                "activity live SoD/EoD collection failed for guild %s",
+                guild.id,
+            )
+
+    async def backfill_current_channel(
+        self,
+        guild,
+        *,
+        channel: discord.TextChannel | None = None,
+    ) -> BackfillResult:
+        async with self.guild_locks[guild.id]:
+            config = await self._store_call(self.store.get_config, guild.id)
+            channel_id = config.sod_eod_channel_id
+            if channel_id is None:
+                raise ValueError("SoD/EoD 채널이 설정되지 않았습니다.")
+            if channel is None:
+                channel = guild.get_channel(channel_id)
+            if (
+                not self._same_guild_resource(channel, discord.TextChannel, guild)
+                or channel.id != channel_id
+            ):
+                raise ChannelChanged(channel_id)
+            if not self._text_channel_is_accessible(channel, guild):
+                raise ValueError("SoD/EoD 텍스트 채널 이력을 읽을 수 없습니다.")
+
+            state = await self._store_call(
+                self.store.get_sync_state,
+                guild.id,
+                channel_id,
+            )
+            after = (
+                None
+                if state is None or state.newest_processed_message_id is None
+                else discord.Object(id=state.newest_processed_message_id)
+            )
+            await self._store_call(
+                self.store.mark_backfill_started,
+                guild.id,
+                channel_id,
+                utc_now_epoch(),
+            )
+
+            processed_count = 0
+            event_count = 0
+            fetched_members = {}
+            async for message in channel.history(
+                limit=None,
+                oldest_first=True,
+                after=after,
+            ):
+                author_id = message.author.id
+                member = guild.get_member(author_id)
+                if member is None:
+                    if author_id not in fetched_members:
+                        try:
+                            fetched_members[author_id] = await guild.fetch_member(
+                                author_id
+                            )
+                        except (discord.NotFound, discord.Forbidden):
+                            fetched_members[author_id] = None
+                    member = fetched_members[author_id]
+
+                event_types = set()
+                if self._message_is_eligible(message, guild, config, member):
+                    event_types = detect_sod_eod(message.content)
+                message_created_epoch = int(message.created_at.timestamp())
+                await self._store_call(
+                    self.store.record_backfill_message_and_advance_cursor,
+                    guild_id=guild.id,
+                    channel_id=channel_id,
+                    message_id=message.id,
+                    user_id=author_id,
+                    message_created_epoch=message_created_epoch,
+                    event_types=event_types,
+                    newest_processed_message_created_epoch=message_created_epoch,
+                    updated_epoch=utc_now_epoch(),
+                    expected_current_channel_id=channel_id,
+                )
+                processed_count += 1
+                event_count += len(event_types)
+
+            current = await self._store_call(self.store.get_config, guild.id)
+            if current.sod_eod_channel_id != channel_id:
+                raise ChannelChanged(channel_id)
+            await self._store_call(
+                self.store.mark_backfill_completed,
+                guild.id,
+                channel_id,
+                utc_now_epoch(),
+            )
+            return BackfillResult(processed_count, event_count)
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after) -> None:
@@ -814,6 +974,28 @@ class ActivityCog(commands.Cog):
             )
         except Exception:
             await self._report_command_error(interaction)
+
+    @settings_group.command(
+        name="과거동기화",
+        description="현재 SoD/EoD 채널의 과거 메시지를 동기화합니다.",
+    )
+    async def backfill_command(self, interaction: discord.Interaction) -> None:
+        if not await require_admin(interaction):
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            result = await self.backfill_current_channel(interaction.guild)
+            await self._complete_ephemeral(
+                interaction,
+                "과거 동기화 완료: "
+                f"처리 {result.processed_count}개, 기록 {result.event_count}개",
+            )
+        except (sqlite3.Error, discord.DiscordException, ChannelChanged, ValueError):
+            logger.exception("activity SoD/EoD backfill failed")
+            await self._complete_ephemeral(
+                interaction,
+                "과거 동기화에 실패했습니다. 설정, 로그와 채널 권한을 확인해 주세요.",
+            )
 
     async def _invalidate_configured_resources(
         self, guild, effective_at_epoch: int

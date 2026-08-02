@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import itertools
 import os
 import sqlite3
@@ -7,12 +8,13 @@ import threading
 import unittest
 from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import discord
 
 import bot as bot_module
-from activity_store import ActivityStore
+from activity_store import ActivityStore, ChannelChanged
 
 from tests.activity_fixtures import (
     FakeBot,
@@ -21,15 +23,22 @@ from tests.activity_fixtures import (
     configured_fixture,
     coverage_gaps,
     fake_category,
+    fake_deferred_interaction,
     fake_interaction,
     fake_role,
     fake_text_channel,
     checkpoint_once_for_test,
+    make_controlled_history_channel,
+    make_history_channel,
     on_disconnect_for_test,
     on_resumed_for_test,
+    prepare_sync_marker,
     recover_after_ready_for_test,
+    record_live_message_for_test,
     run_checkpoint,
     session_rows,
+    set_sod_channel_for_test,
+    sync_state,
 )
 
 
@@ -2143,3 +2152,406 @@ class SettingsCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(len(detail), 2000)
         self.assertIn("시작=1000", detail)
         self.assertIn("시작=1790", detail)
+
+
+class SodEodCollectionTests(unittest.IsolatedAsyncioTestCase):
+    def make_fixture(self):
+        cog, guild, member = configured_fixture()
+        self.addCleanup(cog._test_tmp.cleanup)
+        return cog, guild, member
+
+    @staticmethod
+    def count_events(cog):
+        with closing(sqlite3.connect(cog.store.db_path)) as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM sod_eod_events").fetchone()[0])
+
+    @staticmethod
+    def full_message(
+        message_id,
+        author,
+        channel,
+        content="SoD",
+        *,
+        guild=None,
+        message_type=discord.MessageType.default,
+        webhook_id=None,
+        created_at=None,
+    ):
+        return SimpleNamespace(
+            id=message_id,
+            author=author,
+            channel=channel,
+            guild=author.guild if guild is None else guild,
+            content=content,
+            created_at=created_at
+            or datetime.datetime(2026, 8, 2, tzinfo=datetime.UTC),
+            type=message_type,
+            webhook_id=webhook_id,
+        )
+
+    @staticmethod
+    def http_error(status=500):
+        response = SimpleNamespace(
+            status=status,
+            reason="Server Error",
+            headers={},
+        )
+        return discord.HTTPException(response, "history failed")
+
+    def test_whole_word_casefold_parser_detects_each_type_once(self):
+        from activity_cog import detect_sod_eod
+
+        self.assertEqual(
+            detect_sod_eod("SoD, sod and EOD! eod"),
+            {"sod", "eod"},
+        )
+        self.assertEqual(
+            detect_sod_eod("sodastream preEoDpost SOD2 3eod"),
+            set(),
+        )
+        self.assertEqual(detect_sod_eod("한글SOD_+EOD한글"), {"sod", "eod"})
+
+    async def test_live_listener_accepts_only_shared_eligible_message_shape(self):
+        cog, guild, member = self.make_fixture()
+        configured_channel = guild.get_channel(40)
+        other_channel = fake_text_channel(41, guild)
+        bot_member = FakeMember(2, guild, {10}, bot=True)
+        roleless_member = FakeMember(3, guild, set())
+        guild.members.extend((bot_member, roleless_member))
+        invalid_messages = (
+            self.full_message(1, member, configured_channel, guild=None),
+            self.full_message(2, member, SimpleNamespace(id=41, guild=guild)),
+            self.full_message(3, member, other_channel),
+            self.full_message(
+                4,
+                member,
+                configured_channel,
+                message_type=discord.MessageType.recipient_add,
+            ),
+            self.full_message(5, bot_member, configured_channel),
+            self.full_message(6, roleless_member, configured_channel),
+            self.full_message(7, member, configured_channel, webhook_id=999),
+        )
+        invalid_messages[0].guild = None
+
+        for message in invalid_messages:
+            await cog.on_message(message)
+
+        self.assertEqual(self.count_events(cog), 0)
+        await cog.on_message(self.full_message(8, member, configured_channel))
+        self.assertEqual(self.count_events(cog), 1)
+
+    async def test_live_both_types_are_kst_deduped_without_advancing_cursor(self):
+        cog, guild, member = self.make_fixture()
+        channel = guild.get_channel(40)
+        created_at = datetime.datetime(2026, 8, 1, 16, 30, tzinfo=datetime.UTC)
+        message = self.full_message(
+            20,
+            member,
+            channel,
+            "SoD and EOD!",
+            created_at=created_at,
+        )
+
+        await cog.on_message(message)
+        await cog.on_message(message)
+
+        self.assertEqual(self.count_events(cog), 2)
+        self.assertEqual(
+            await cog._store_call(cog.store.daily_types, 1, 1, "2026-08-02"),
+            {"sod", "eod"},
+        )
+        state = await sync_state(cog, 40)
+        self.assertIsNone(state.newest_processed_message_id)
+        self.assertIsNone(state.history_from_epoch)
+
+    async def test_live_store_failure_is_shielded_from_other_bot_features(self):
+        cog, guild, member = self.make_fixture()
+        error = sqlite3.Error("database unavailable")
+        with mock.patch.object(
+            cog.store,
+            "record_live_message",
+            side_effect=error,
+        ), mock.patch("activity_cog.logger.exception") as logged:
+            await cog.on_message(
+                self.full_message(21, member, guild.get_channel(40))
+            )
+
+        logged.assert_called_once()
+
+    async def test_backfill_uses_exclusive_after_marker_and_oldest_first(self):
+        cog, guild, member = self.make_fixture()
+        await prepare_sync_marker(cog, channel_id=40, message_id=11)
+        message = self.full_message(12, member, guild.get_channel(40))
+        channel = make_history_channel(guild, 40, [message])
+
+        await cog.backfill_current_channel(guild, channel=channel)
+
+        channel.history.assert_called_once_with(
+            limit=None,
+            oldest_first=True,
+            after=discord.Object(id=11),
+        )
+        self.assertEqual((await sync_state(cog, 40)).newest_processed_message_id, 12)
+
+    async def test_backfill_streams_more_than_one_api_page_before_next_yield(self):
+        cog, guild, member = self.make_fixture()
+        channel = fake_text_channel(40, guild)
+        total = 125
+
+        async def history(**kwargs):
+            for message_id in range(1, total + 1):
+                if message_id > 1:
+                    state = cog.store.get_sync_state(guild.id, channel.id)
+                    self.assertEqual(
+                        state.newest_processed_message_id,
+                        message_id - 1,
+                        "history was consumed ahead of per-message commit",
+                    )
+                yield self.full_message(message_id, member, channel)
+
+        channel.history.side_effect = history
+        result = await cog.backfill_current_channel(guild, channel=channel)
+
+        self.assertEqual(result.processed_count, total)
+        self.assertEqual(result.event_count, total)
+        state = await sync_state(cog, 40)
+        self.assertEqual(state.newest_processed_message_id, total)
+        self.assertIsNotNone(state.completed_epoch)
+
+    async def test_backfill_unresolved_author_is_fetched_once_and_advances_empty(self):
+        cog, guild, _member = self.make_fixture()
+        channel = fake_text_channel(40, guild)
+        author = SimpleNamespace(id=99, bot=False)
+        messages = [
+            SimpleNamespace(
+                id=message_id,
+                author=author,
+                channel=channel,
+                guild=guild,
+                content="SoD",
+                created_at=datetime.datetime(2026, 8, 2, tzinfo=datetime.UTC),
+                type=discord.MessageType.default,
+                webhook_id=None,
+            )
+            for message_id in (12, 13)
+        ]
+        channel.history.side_effect = lambda **kwargs: self._iterate(messages)
+        not_found = discord.NotFound(
+            SimpleNamespace(status=404, reason="Not Found", headers={}),
+            "member",
+        )
+        guild.fetch_member = mock.AsyncMock(side_effect=not_found)
+
+        result = await cog.backfill_current_channel(guild, channel=channel)
+
+        self.assertEqual(result.processed_count, 2)
+        self.assertEqual(result.event_count, 0)
+        self.assertEqual(self.count_events(cog), 0)
+        self.assertEqual((await sync_state(cog, 40)).newest_processed_message_id, 13)
+        guild.fetch_member.assert_awaited_once_with(99)
+
+    @staticmethod
+    async def _iterate(items):
+        for item in items:
+            yield item
+
+    async def test_backfill_fetches_missing_eligible_member_once_and_memoizes(self):
+        cog, guild, member = self.make_fixture()
+        guild.members = []
+        channel = fake_text_channel(40, guild)
+        messages = [
+            self.full_message(message_id, member, channel)
+            for message_id in (30, 31)
+        ]
+        channel.history.side_effect = lambda **kwargs: self._iterate(messages)
+        guild.fetch_member = mock.AsyncMock(return_value=member)
+
+        await cog.backfill_current_channel(guild, channel=channel)
+
+        guild.fetch_member.assert_awaited_once_with(member.id)
+        self.assertEqual(self.count_events(cog), 2)
+
+    async def test_backfill_history_interruption_resumes_at_last_committed_message(self):
+        cog, guild, member = self.make_fixture()
+        channel = fake_text_channel(40, guild)
+
+        async def interrupted_history(**kwargs):
+            yield self.full_message(50, member, channel)
+            raise self.http_error()
+
+        channel.history.side_effect = interrupted_history
+        with self.assertRaises(discord.HTTPException):
+            await cog.backfill_current_channel(guild, channel=channel)
+
+        interrupted_state = await sync_state(cog, 40)
+        self.assertEqual(interrupted_state.newest_processed_message_id, 50)
+        self.assertIsNone(interrupted_state.completed_epoch)
+
+        resumed = make_history_channel(
+            guild,
+            40,
+            [self.full_message(51, member, guild.get_channel(40))],
+        )
+        await cog.backfill_current_channel(guild, channel=resumed)
+        resumed.history.assert_called_once_with(
+            limit=None,
+            oldest_first=True,
+            after=discord.Object(id=50),
+        )
+        self.assertIsNotNone((await sync_state(cog, 40)).completed_epoch)
+
+    async def test_backfill_database_interruption_does_not_skip_failed_message(self):
+        cog, guild, member = self.make_fixture()
+        channel = make_history_channel(
+            guild,
+            40,
+            [
+                self.full_message(60, member, guild.get_channel(40)),
+                self.full_message(61, member, guild.get_channel(40)),
+            ],
+        )
+        original = cog.store.record_backfill_message_and_advance_cursor
+
+        def fail_second(**kwargs):
+            if kwargs["message_id"] == 61:
+                raise sqlite3.Error("database unavailable")
+            return original(**kwargs)
+
+        with mock.patch.object(
+            cog.store,
+            "record_backfill_message_and_advance_cursor",
+            side_effect=fail_second,
+        ), self.assertRaises(sqlite3.Error):
+            await cog.backfill_current_channel(guild, channel=channel)
+
+        state = await sync_state(cog, 40)
+        self.assertEqual(state.newest_processed_message_id, 60)
+        self.assertIsNone(state.completed_epoch)
+
+    async def test_live_overlap_before_backfill_dedupes_and_still_moves_cursor(self):
+        cog, guild, member = self.make_fixture()
+        await prepare_sync_marker(cog, channel_id=40, message_id=11)
+        await record_live_message_for_test(cog, message_id=13, content="SoD")
+        self.assertEqual((await sync_state(cog, 40)).newest_processed_message_id, 11)
+        channel = make_history_channel(
+            guild,
+            40,
+            [self.full_message(13, member, guild.get_channel(40))],
+        )
+
+        await cog.backfill_current_channel(guild, channel=channel)
+
+        self.assertEqual((await sync_state(cog, 40)).newest_processed_message_id, 13)
+        self.assertEqual(self.count_events(cog), 1)
+
+    async def test_backfill_holds_existing_guild_lock_before_sod_change(self):
+        cog, guild, member = self.make_fixture()
+        entered, release = asyncio.Event(), asyncio.Event()
+        channel = make_controlled_history_channel(
+            guild,
+            40,
+            [self.full_message(70, member, guild.get_channel(40))],
+            entered,
+            release,
+        )
+        backfill = asyncio.create_task(
+            cog.backfill_current_channel(guild, channel=channel)
+        )
+        await entered.wait()
+        change = asyncio.create_task(set_sod_channel_for_test(cog, guild, 41, 101))
+        await asyncio.sleep(0)
+
+        self.assertFalse(change.done())
+        release.set()
+        await backfill
+        await change
+        config = await cog._store_call(cog.store.get_config, guild.id)
+        self.assertEqual(config.sod_eod_channel_id, 41)
+
+    async def test_backfill_rejects_wrong_or_inaccessible_current_channel(self):
+        for replacement in (
+            lambda guild: fake_category(40, guild),
+            lambda guild: fake_text_channel(40, guild, can_read=False),
+        ):
+            with self.subTest(replacement=replacement):
+                cog, guild, _member = self.make_fixture()
+                guild.channels = [
+                    channel for channel in guild.channels if channel.id != 40
+                ] + [replacement(guild)]
+
+                with self.assertRaises((ValueError, ChannelChanged)):
+                    await cog.backfill_current_channel(guild)
+
+                state = await sync_state(cog, 40)
+                self.assertIsNone(state.newest_processed_message_id)
+                self.assertIsNone(state.completed_epoch)
+
+    async def test_backfill_command_guards_then_defers_before_lock_and_lookup(self):
+        cog, guild, member = self.make_fixture()
+        unauthorized = fake_interaction(2, False, guild)
+        with mock.patch.object(
+            cog,
+            "backfill_current_channel",
+            new=mock.AsyncMock(),
+        ) as backfill:
+            await cog.backfill_command.callback(cog, unauthorized)
+        backfill.assert_not_awaited()
+        self.assertFalse(unauthorized.response.deferred)
+
+        channel = make_history_channel(
+            guild,
+            40,
+            [self.full_message(80, member, guild.get_channel(40))],
+        )
+        guild.channels = [item for item in guild.channels if item.id != 40] + [channel]
+        interaction = fake_deferred_interaction(1, True, guild)
+        deferred = asyncio.Event()
+        original_defer = interaction.response.defer
+
+        async def observe_defer(**kwargs):
+            await original_defer(**kwargs)
+            deferred.set()
+
+        interaction.response.defer = observe_defer
+        holder_entered, release_holder = asyncio.Event(), asyncio.Event()
+
+        async def hold_lock():
+            async with cog.guild_locks[guild.id]:
+                holder_entered.set()
+                await release_holder.wait()
+
+        holder = asyncio.create_task(hold_lock())
+        await holder_entered.wait()
+        command = asyncio.create_task(cog.backfill_command.callback(cog, interaction))
+        await asyncio.wait_for(deferred.wait(), 1)
+
+        self.assertTrue(interaction.response.defer_kwargs["ephemeral"])
+        channel.history.assert_not_called()
+        release_holder.set()
+        await asyncio.gather(holder, command)
+        self.assertEqual(len(interaction.original_edits), 1)
+        self.assertEqual(interaction.followup.sent, [])
+
+    async def test_backfill_command_error_completes_deferred_response_once(self):
+        cog, guild, _member = self.make_fixture()
+        interaction = fake_deferred_interaction(1, True, guild)
+        with mock.patch.object(
+            cog,
+            "backfill_current_channel",
+            new=mock.AsyncMock(side_effect=sqlite3.Error("database unavailable")),
+        ), mock.patch("activity_cog.logger.exception"):
+            await cog.backfill_command.callback(cog, interaction)
+
+        self.assertTrue(interaction.response.deferred)
+        self.assertEqual(len(interaction.original_edits), 1)
+        self.assertIn("실패", interaction.original_edits[0]["content"])
+        self.assertEqual(interaction.followup.sent, [])
+
+    def test_only_message_create_listener_is_registered_for_text_activity(self):
+        from activity_cog import ActivityCog
+
+        listener_names = {name for name, _method_name in ActivityCog.__cog_listeners__}
+        self.assertIn("on_message", listener_names)
+        self.assertNotIn("on_message_edit", listener_names)
+        self.assertNotIn("on_message_delete", listener_names)
