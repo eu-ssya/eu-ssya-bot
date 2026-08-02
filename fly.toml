@@ -6,6 +6,7 @@ primary_region = "nrt"
 
 [env]
   DATA_FILE = "/data/rss_data.json"
+  ACTIVITY_DB_PATH = "/data/activity.db"
   LOG_LEVEL = "INFO"
   TZ = "Asia/Seoul"
 

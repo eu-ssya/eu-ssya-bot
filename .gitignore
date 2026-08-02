@@ -498,4 +498,8 @@ pyrightconfig.json
 .worktrees/
 .discord-token
 **/rss_data.json
+activity.db
+activity.db-wal
+activity.db-shm
+/data/
 .superpowers/

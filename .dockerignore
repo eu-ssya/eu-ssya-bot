@@ -6,6 +6,10 @@ __pycache__/
 .env
 .env.*
 rss_data.json
+activity.db
+activity.db-wal
+activity.db-shm
+/data/
 .git/
 .github/
 .omc/
