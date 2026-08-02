@@ -1,4 +1,5 @@
 import asyncio
+import io
 import logging
 import os
 from collections import defaultdict
@@ -61,11 +62,29 @@ class ActivityCog(commands.Cog):
         )
 
     @staticmethod
-    async def _send_ephemeral(interaction, content: str) -> None:
-        if interaction.response.is_done():
-            await interaction.followup.send(content, ephemeral=True)
-        else:
-            await interaction.response.send_message(content, ephemeral=True)
+    async def _complete_ephemeral(
+        interaction,
+        content: str,
+        *,
+        attachments: list[discord.File] | None = None,
+    ) -> None:
+        kwargs = {"content": content}
+        if attachments is not None:
+            kwargs["attachments"] = attachments
+        await interaction.edit_original_response(**kwargs)
+
+    @staticmethod
+    def _category_is_accessible(category, guild) -> bool:
+        permissions = category.permissions_for(guild.me)
+        return bool(getattr(permissions, "view_channel", False))
+
+    @staticmethod
+    def _text_channel_is_accessible(channel, guild) -> bool:
+        permissions = channel.permissions_for(guild.me)
+        return bool(
+            getattr(permissions, "view_channel", False)
+            and getattr(permissions, "read_message_history", False)
+        )
 
     async def reconcile_member(
         self,
@@ -103,6 +122,9 @@ class ActivityCog(commands.Cog):
         )
 
     async def full_reconcile_guild(self, guild, effective_at_epoch: int) -> None:
+        """Reconcile one guild while the caller holds its guild lock."""
+        if not self.guild_locks[guild.id].locked():
+            raise RuntimeError("full_reconcile_guild requires the guild lock")
         config = await self._store_call(self.store.get_config, guild.id)
         role = (
             None
@@ -125,6 +147,8 @@ class ActivityCog(commands.Cog):
             and self._same_guild_resource(reading, discord.CategoryChannel, guild)
             and self._same_guild_resource(study, discord.CategoryChannel, guild)
             and reading.id != study.id
+            and self._category_is_accessible(reading, guild)
+            and self._category_is_accessible(study, guild)
         )
         if not valid:
             self.collection_gates[guild.id].clear()
@@ -202,7 +226,7 @@ class ActivityCog(commands.Cog):
 
     async def _report_command_error(self, interaction) -> None:
         logger.exception("activity settings command failed")
-        await self._send_ephemeral(
+        await self._complete_ephemeral(
             interaction, "활동 설정 요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요."
         )
 
@@ -213,16 +237,17 @@ class ActivityCog(commands.Cog):
         if not await require_admin(interaction):
             return
         try:
+            await interaction.response.defer(ephemeral=True)
             guild = interaction.guild
             if not self._same_guild_resource(역할, discord.Role, guild):
-                await self._send_ephemeral(
+                await self._complete_ephemeral(
                     interaction, "이 서버의 역할만 설정할 수 있습니다."
                 )
                 return
             await self._change_voice_setting(
                 guild, utc_now_epoch(), target_role_id=역할.id
             )
-            await self._send_ephemeral(
+            await self._complete_ephemeral(
                 interaction, f"대상 역할을 {역할.id}(으)로 설정했습니다."
             )
         except Exception:
@@ -235,25 +260,31 @@ class ActivityCog(commands.Cog):
         if not await require_admin(interaction):
             return
         try:
+            await interaction.response.defer(ephemeral=True)
             guild = interaction.guild
             if not self._same_guild_resource(
                 카테고리, discord.CategoryChannel, guild
             ):
-                await self._send_ephemeral(
+                await self._complete_ephemeral(
                     interaction, "이 서버의 카테고리만 설정할 수 있습니다."
+                )
+                return
+            if not self._category_is_accessible(카테고리, guild):
+                await self._complete_ephemeral(
+                    interaction, "봇이 이 카테고리에 접근할 수 없습니다."
                 )
                 return
             if not await self._validate_distinct_category(
                 guild, field="reading_category_id", category_id=카테고리.id
             ):
-                await self._send_ephemeral(
+                await self._complete_ephemeral(
                     interaction, "독서실과 스터디 카테고리는 서로 달라야 합니다."
                 )
                 return
             await self._change_voice_setting(
                 guild, utc_now_epoch(), reading_category_id=카테고리.id
             )
-            await self._send_ephemeral(
+            await self._complete_ephemeral(
                 interaction, f"독서실 카테고리를 {카테고리.id}(으)로 설정했습니다."
             )
         except Exception:
@@ -266,25 +297,31 @@ class ActivityCog(commands.Cog):
         if not await require_admin(interaction):
             return
         try:
+            await interaction.response.defer(ephemeral=True)
             guild = interaction.guild
             if not self._same_guild_resource(
                 카테고리, discord.CategoryChannel, guild
             ):
-                await self._send_ephemeral(
+                await self._complete_ephemeral(
                     interaction, "이 서버의 카테고리만 설정할 수 있습니다."
+                )
+                return
+            if not self._category_is_accessible(카테고리, guild):
+                await self._complete_ephemeral(
+                    interaction, "봇이 이 카테고리에 접근할 수 없습니다."
                 )
                 return
             if not await self._validate_distinct_category(
                 guild, field="study_category_id", category_id=카테고리.id
             ):
-                await self._send_ephemeral(
+                await self._complete_ephemeral(
                     interaction, "독서실과 스터디 카테고리는 서로 달라야 합니다."
                 )
                 return
             await self._change_voice_setting(
                 guild, utc_now_epoch(), study_category_id=카테고리.id
             )
-            await self._send_ephemeral(
+            await self._complete_ephemeral(
                 interaction, f"스터디 카테고리를 {카테고리.id}(으)로 설정했습니다."
             )
         except Exception:
@@ -297,14 +334,20 @@ class ActivityCog(commands.Cog):
         if not await require_admin(interaction):
             return
         try:
+            await interaction.response.defer(ephemeral=True)
             guild = interaction.guild
             if not self._same_guild_resource(채널, discord.TextChannel, guild):
-                await self._send_ephemeral(
+                await self._complete_ephemeral(
                     interaction, "이 서버의 텍스트 채널만 설정할 수 있습니다."
                 )
                 return
+            if not self._text_channel_is_accessible(채널, guild):
+                await self._complete_ephemeral(
+                    interaction, "봇이 이 텍스트 채널의 이력을 읽을 수 없습니다."
+                )
+                return
             await self._change_sod_setting(guild, utc_now_epoch(), 채널.id)
-            await self._send_ephemeral(
+            await self._complete_ephemeral(
                 interaction, f"SoD/EoD 채널을 {채널.id}(으)로 설정했습니다."
             )
         except Exception:
@@ -322,32 +365,51 @@ class ActivityCog(commands.Cog):
                     discord.Role,
                     guild.get_role,
                     "대상 역할을 찾을 수 없습니다.",
+                    None,
+                    None,
                 ),
                 (
                     "reading_category_id",
                     discord.CategoryChannel,
                     guild.get_channel,
                     "독서실 카테고리를 찾을 수 없습니다.",
+                    self._category_is_accessible,
+                    "독서실 카테고리에 접근할 수 없습니다.",
                 ),
                 (
                     "study_category_id",
                     discord.CategoryChannel,
                     guild.get_channel,
                     "스터디 카테고리를 찾을 수 없습니다.",
+                    self._category_is_accessible,
+                    "스터디 카테고리에 접근할 수 없습니다.",
                 ),
                 (
                     "sod_eod_channel_id",
                     discord.TextChannel,
                     guild.get_channel,
                     "SoD/EoD 텍스트 채널을 찾을 수 없습니다.",
+                    self._text_channel_is_accessible,
+                    "SoD/EoD 텍스트 채널에 접근할 수 없습니다.",
                 ),
             )
-            for field, resource_type, resolver, warning in checks:
+            for (
+                field,
+                resource_type,
+                resolver,
+                missing_warning,
+                access_check,
+                access_warning,
+            ) in checks:
                 resource_id = getattr(config, field)
                 if resource_id is None:
                     continue
                 resource = resolver(resource_id)
-                if self._same_guild_resource(resource, resource_type, guild):
+                if not self._same_guild_resource(resource, resource_type, guild):
+                    warning = missing_warning
+                elif access_check is not None and not access_check(resource, guild):
+                    warning = access_warning
+                else:
                     continue
                 if field == "sod_eod_channel_id":
                     config = await self._store_call(
@@ -371,6 +433,7 @@ class ActivityCog(commands.Cog):
         if not await require_admin(interaction):
             return
         try:
+            await interaction.response.defer(ephemeral=True)
             guild = interaction.guild
             config, warnings = await self._invalidate_configured_resources(
                 guild, utc_now_epoch()
@@ -419,7 +482,23 @@ class ActivityCog(commands.Cog):
             if warnings:
                 lines.append("경고:")
                 lines.extend(f"- {warning}" for warning in warnings)
-            await self._send_ephemeral(interaction, "\n".join(lines))
+            detail = "\n".join(lines)
+            if len(detail) <= 2000:
+                await self._complete_ephemeral(interaction, detail)
+            else:
+                summary = "\n".join(
+                    lines[:6]
+                    + ["상세 상태가 길어 전체 내용을 TXT 파일로 첨부했습니다."]
+                )
+                attachment = discord.File(
+                    io.BytesIO(detail.encode("utf-8")),
+                    filename=f"activity-status-{guild.id}.txt",
+                )
+                await self._complete_ephemeral(
+                    interaction,
+                    summary,
+                    attachments=[attachment],
+                )
         except Exception:
             await self._report_command_error(interaction)
 

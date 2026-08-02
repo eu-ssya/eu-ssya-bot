@@ -125,6 +125,12 @@ class ConfigurationTests(unittest.TestCase):
             lambda: self.store.invalidate_sod_eod_channel(
                 1, effective_at_epoch=100.5
             ),
+            lambda: self.store.invalidate_voice_config(
+                1, field="reading_category_id", effective_at_epoch=100.5
+            ),
+            lambda: self.store.abort_full_reconcile(
+                1, effective_at_epoch=100.5
+            ),
         ]
 
         for operation in operations:
@@ -246,6 +252,84 @@ class ConfigurationTests(unittest.TestCase):
                 """
             ).fetchone()
         self.assertEqual(period, (40, 100, 120, "config_invalid"))
+
+    def test_voice_invalidation_closes_rows_atomically(self):
+        self.store.apply_config_change(
+            1,
+            target_role_id=10,
+            reading_category_id=20,
+            study_category_id=30,
+            effective_at_epoch=90,
+        )
+        self._insert_open_voice_rows()
+
+        self.store.invalidate_voice_config(
+            1, field="reading_category_id", effective_at_epoch=120
+        )
+
+        self.assertIsNone(self.store.get_config(1).reading_category_id)
+        self.assertEqual(
+            self._open_voice_rows(),
+            ([(120, "config_changed")], [(120, "config_invalid")]),
+        )
+
+    def test_voice_invalidation_rolls_back_rows_when_config_update_fails(self):
+        self.store.apply_config_change(
+            1,
+            target_role_id=10,
+            reading_category_id=20,
+            study_category_id=30,
+            effective_at_epoch=90,
+        )
+        self._insert_open_voice_rows()
+        with closing(self.store._connect()) as conn:
+            conn.execute(
+                """
+                CREATE TRIGGER fail_activity_config_update
+                BEFORE UPDATE ON activity_config
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced config failure');
+                END
+                """
+            )
+            conn.commit()
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.invalidate_voice_config(
+                1, field="reading_category_id", effective_at_epoch=120
+            )
+
+        self.assertEqual(self.store.get_config(1).reading_category_id, 20)
+        self.assertEqual(self._open_voice_rows(), ([(None, None)], [(None, None)]))
+
+    def test_abort_full_reconcile_closes_rows_atomically(self):
+        self._insert_open_voice_rows()
+
+        self.store.abort_full_reconcile(1, effective_at_epoch=120)
+
+        self.assertEqual(
+            self._open_voice_rows(),
+            ([(120, "config_changed")], [(120, "config_invalid")]),
+        )
+
+    def test_abort_full_reconcile_rolls_back_session_when_run_update_fails(self):
+        self._insert_open_voice_rows()
+        with closing(self.store._connect()) as conn:
+            conn.execute(
+                """
+                CREATE TRIGGER fail_run_update
+                BEFORE UPDATE ON voice_collection_runs
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced run failure');
+                END
+                """
+            )
+            conn.commit()
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.abort_full_reconcile(1, effective_at_epoch=120)
+
+        self.assertEqual(self._open_voice_rows(), ([(None, None)], [(None, None)]))
 
 
 class VoiceSessionTests(unittest.TestCase):

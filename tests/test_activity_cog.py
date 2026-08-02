@@ -329,6 +329,7 @@ class SettingsCommandTests(unittest.IsolatedAsyncioTestCase):
                 interaction = fake_interaction(2, False, guild)
                 await self.invoke(command, cog, interaction, resource)
                 self.assertTrue(interaction.response.sent[0][1]["ephemeral"])
+                self.assertFalse(interaction.response.deferred)
                 self.assertEqual(
                     await cog._store_call(cog.store.get_config, guild.id), original
                 )
@@ -338,6 +339,7 @@ class SettingsCommandTests(unittest.IsolatedAsyncioTestCase):
                 interaction.guild = None
                 await self.invoke(command, cog, interaction, resource)
                 self.assertTrue(interaction.response.sent[0][1]["ephemeral"])
+                self.assertFalse(interaction.response.deferred)
                 self.assertEqual(
                     await cog._store_call(cog.store.get_config, guild.id), original
                 )
@@ -374,7 +376,75 @@ class SettingsCommandTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(command=command.name, resource=resource.id):
                 interaction = fake_interaction(1, True, guild)
                 await self.invoke(command, cog, interaction, resource, now=200)
-                self.assertTrue(interaction.response.sent[0][1]["ephemeral"])
+                self.assertTrue(interaction.response.deferred)
+                self.assertTrue(interaction.response.defer_kwargs["ephemeral"])
+                self.assertEqual(len(interaction.original_edits), 1)
+                self.assertEqual(
+                    await cog._store_call(cog.store.get_config, guild.id), original
+                )
+
+    async def test_admin_callbacks_defer_ephemeral_before_first_store_call(self):
+        cog, guild = await self.make_cog()
+        cases = (
+            (cog.set_target_role, guild.roles[0]),
+            (cog.set_reading_category, guild.channels[0]),
+            (cog.set_study_category, guild.channels[1]),
+            (cog.set_sod_eod_channel, guild.channels[2]),
+            (cog.activity_status, None),
+        )
+        for command, resource in cases:
+            with self.subTest(command=command.name):
+                interaction = fake_interaction(1, True, guild)
+                observations = []
+                original_store_call = cog._store_call
+
+                async def observe_defer(method, *args, **kwargs):
+                    observations.append(
+                        interaction.response.deferred
+                        and interaction.response.defer_kwargs.get("ephemeral") is True
+                    )
+                    return await original_store_call(method, *args, **kwargs)
+
+                with mock.patch.object(cog, "_store_call", side_effect=observe_defer):
+                    await self.invoke(command, cog, interaction, resource)
+
+                self.assertTrue(observations)
+                self.assertTrue(all(observations))
+                self.assertEqual(interaction.response.sent, [])
+                self.assertEqual(len(interaction.original_edits), 1)
+
+    async def test_inaccessible_category_and_text_setters_do_not_mutate(self):
+        cog, guild = await self.make_cog()
+        await self.set_complete_config(cog, guild)
+        inaccessible_category = fake_category(21, guild, can_read=False)
+        inaccessible_text = fake_text_channel(41, guild)
+        inaccessible_text.permissions_for.return_value = mock.Mock(
+            view_channel=True,
+            read_message_history=False,
+        )
+        invisible_text = fake_text_channel(42, guild)
+        invisible_text.permissions_for.return_value = mock.Mock(
+            view_channel=False,
+            read_message_history=True,
+        )
+        guild.channels.extend(
+            (inaccessible_category, inaccessible_text, invisible_text)
+        )
+        original = await cog._store_call(cog.store.get_config, guild.id)
+
+        for command, resource in (
+            (cog.set_reading_category, inaccessible_category),
+            (cog.set_study_category, inaccessible_category),
+            (cog.set_sod_eod_channel, inaccessible_text),
+            (cog.set_sod_eod_channel, invisible_text),
+        ):
+            with self.subTest(command=command.name):
+                interaction = fake_interaction(1, True, guild)
+                await self.invoke(command, cog, interaction, resource, now=200)
+
+                self.assertTrue(interaction.response.deferred)
+                self.assertEqual(len(interaction.original_edits), 1)
+                self.assertIn("수 없습니다", interaction.original_edits[0]["content"])
                 self.assertEqual(
                     await cog._store_call(cog.store.get_config, guild.id), original
                 )
@@ -444,7 +514,8 @@ class SettingsCommandTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(
             cog.store, "open_collection_run", side_effect=error
         ), self.assertRaises(sqlite3.Error) as raised:
-            await cog.full_reconcile_guild(guild, 101)
+            async with cog.guild_locks[guild.id]:
+                await cog.full_reconcile_guild(guild, 101)
 
         self.assertIs(raised.exception, error)
         self.assertFalse(cog.collection_gates[guild.id].is_set())
@@ -473,7 +544,8 @@ class SettingsCommandTests(unittest.IsolatedAsyncioTestCase):
 
         with mock.patch.object(cog, "reconcile_member", side_effect=fail_after_first):
             with self.assertRaises(sqlite3.Error):
-                await cog.full_reconcile_guild(guild, 101)
+                async with cog.guild_locks[guild.id]:
+                    await cog.full_reconcile_guild(guild, 101)
 
         self.assertFalse(cog.collection_gates[guild.id].is_set())
         self.assertEqual(
@@ -541,16 +613,17 @@ class SettingsCommandTests(unittest.IsolatedAsyncioTestCase):
                 guild.channels[2],
             )
 
-        self.assertEqual(len(interaction.response.sent), 1)
-        content, kwargs = interaction.response.sent[0]
-        self.assertIn("처리하지 못했습니다", content)
-        self.assertTrue(kwargs["ephemeral"])
+        self.assertTrue(interaction.response.deferred)
+        self.assertEqual(interaction.response.sent, [])
+        self.assertEqual(len(interaction.original_edits), 1)
+        self.assertIn(
+            "처리하지 못했습니다", interaction.original_edits[0]["content"]
+        )
         self.assertEqual(interaction.followup.sent, [])
 
-    async def test_status_store_failure_uses_ephemeral_followup_if_already_done(self):
+    async def test_status_store_failure_edits_deferred_ephemeral_response_once(self):
         cog, guild = await self.make_cog()
         interaction = fake_interaction(1, True, guild)
-        interaction.response.done = True
         error = sqlite3.Error("database unavailable")
 
         with mock.patch.object(
@@ -558,11 +631,13 @@ class SettingsCommandTests(unittest.IsolatedAsyncioTestCase):
         ), mock.patch("activity_cog.logger.exception"):
             await self.invoke(cog.activity_status, cog, interaction)
 
+        self.assertTrue(interaction.response.deferred)
         self.assertEqual(interaction.response.sent, [])
-        self.assertEqual(len(interaction.followup.sent), 1)
-        content, kwargs = interaction.followup.sent[0]
-        self.assertIn("처리하지 못했습니다", content)
-        self.assertTrue(kwargs["ephemeral"])
+        self.assertEqual(interaction.followup.sent, [])
+        self.assertEqual(len(interaction.original_edits), 1)
+        self.assertIn(
+            "처리하지 못했습니다", interaction.original_edits[0]["content"]
+        )
 
     async def test_status_invalidates_missing_role_with_config_invalid_run(self):
         cog, guild = await self.make_cog()
@@ -573,8 +648,8 @@ class SettingsCommandTests(unittest.IsolatedAsyncioTestCase):
 
         await self.invoke(cog.activity_status, cog, interaction, now=200)
 
-        content, kwargs = interaction.response.sent[0]
-        self.assertTrue(kwargs["ephemeral"])
+        self.assertTrue(interaction.response.defer_kwargs["ephemeral"])
+        content = interaction.original_edits[0]["content"]
         self.assertIn("대상 역할을 찾을 수 없습니다", content)
         self.assertIsNone(
             (await cog._store_call(cog.store.get_config, 1)).target_role_id
@@ -600,7 +675,7 @@ class SettingsCommandTests(unittest.IsolatedAsyncioTestCase):
 
         await self.invoke(cog.activity_status, cog, interaction, now=210)
 
-        content = interaction.response.sent[0][0]
+        content = interaction.original_edits[0]["content"]
         self.assertIn("독서실 카테고리를 찾을 수 없습니다", content)
         self.assertIn("SoD/EoD 텍스트 채널을 찾을 수 없습니다", content)
         config = await cog._store_call(cog.store.get_config, 1)
@@ -618,8 +693,8 @@ class SettingsCommandTests(unittest.IsolatedAsyncioTestCase):
 
         await self.invoke(cog.activity_status, cog, interaction, now=220)
 
-        content, kwargs = interaction.response.sent[0]
-        self.assertTrue(kwargs["ephemeral"])
+        self.assertTrue(interaction.response.defer_kwargs["ephemeral"])
+        content = interaction.original_edits[0]["content"]
         self.assertIn("대상 역할 ID: 미설정", content)
         self.assertIn("독서실 카테고리 ID: 미설정", content)
         self.assertIn("스터디 카테고리 ID: 미설정", content)
@@ -628,3 +703,98 @@ class SettingsCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("열린 수집 run: 0", content)
         self.assertNotIn("Secret Name", content)
         self.assertNotIn("user_id", content)
+
+    async def test_status_invalidates_inaccessible_voice_and_sod_resources(self):
+        cog, guild = await self.make_cog()
+        await self.set_complete_config(cog, guild)
+        await cog.reconcile_member(guild.members[0], 100)
+        guild.channels[0].permissions_for.return_value = mock.Mock(
+            view_channel=False
+        )
+        guild.channels[2].permissions_for.return_value = mock.Mock(
+            view_channel=True,
+            read_message_history=False,
+        )
+        interaction = fake_interaction(1, True, guild)
+
+        await self.invoke(cog.activity_status, cog, interaction, now=210)
+
+        content = interaction.original_edits[0]["content"]
+        self.assertIn("독서실 카테고리에 접근할 수 없습니다", content)
+        self.assertIn("SoD/EoD 텍스트 채널에 접근할 수 없습니다", content)
+        config = await cog._store_call(cog.store.get_config, guild.id)
+        self.assertIsNone(config.reading_category_id)
+        self.assertIsNone(config.sod_eod_channel_id)
+        self.assertEqual(
+            await cog._store_call(cog.store.list_sessions, guild.id, 1),
+            [("reading_room", 100, 210, "config_changed")],
+        )
+        self.assertEqual(
+            await cog._store_call(cog.store.list_runs, guild.id),
+            [(1, 1, 210, "config_invalid")],
+        )
+        with closing(sqlite3.connect(cog.store.db_path)) as conn:
+            period = conn.execute(
+                "SELECT ended_epoch, ended_reason FROM sod_eod_channel_periods"
+            ).fetchone()
+        self.assertEqual(period, (210, "config_invalid"))
+
+    async def test_full_reconcile_requires_lock_and_accessible_categories(self):
+        cog, guild = await self.make_cog()
+        await cog._store_call(
+            cog.store.apply_config_change,
+            guild.id,
+            target_role_id=10,
+            reading_category_id=20,
+            study_category_id=30,
+            effective_at_epoch=1,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "guild lock"):
+            await cog.full_reconcile_guild(guild, 100)
+
+        guild.channels[1].permissions_for.return_value = mock.Mock(
+            view_channel=False
+        )
+        async with cog.guild_locks[guild.id]:
+            await cog.full_reconcile_guild(guild, 100)
+
+        self.assertFalse(cog.collection_gates[guild.id].is_set())
+        self.assertEqual(await cog._store_call(cog.store.list_runs, guild.id), [])
+        self.assertEqual(
+            await cog._store_call(cog.store.count_open_sessions, guild.id), 0
+        )
+
+    async def test_long_status_is_bounded_and_preserves_detail_in_utf8_attachment(self):
+        cog, guild = await self.make_cog()
+        await self.set_complete_config(cog, guild)
+        with closing(sqlite3.connect(cog.store.db_path)) as conn:
+            conn.executemany(
+                """
+                INSERT INTO voice_collection_runs(
+                    guild_id, started_epoch, last_checkpoint_epoch,
+                    ended_epoch, ended_reason
+                ) VALUES (1, ?, ?, ?, 'config_changed')
+                """,
+                [
+                    (1000 + index * 10, 1000 + index * 10, 1005 + index * 10)
+                    for index in range(80)
+                ],
+            )
+            conn.commit()
+        interaction = fake_interaction(1, True, guild)
+
+        await self.invoke(cog.activity_status, cog, interaction, now=3000)
+
+        self.assertEqual(interaction.response.sent, [])
+        self.assertEqual(interaction.followup.sent, [])
+        self.assertEqual(len(interaction.original_edits), 1)
+        edit = interaction.original_edits[0]
+        self.assertLessEqual(len(edit["content"]), 2000)
+        self.assertEqual(len(edit["attachments"]), 1)
+        attachment = edit["attachments"][0]
+        self.assertTrue(attachment.filename.endswith(".txt"))
+        detail = attachment.fp.getvalue().decode("utf-8")
+        self.assertGreater(len(detail), 2000)
+        self.assertIn("시작=1000", detail)
+        self.assertIn("시작=1790", detail)

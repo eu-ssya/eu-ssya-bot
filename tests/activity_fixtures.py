@@ -39,6 +39,7 @@ class FakeResponse:
     sent: list = field(default_factory=list)
     edits: list = field(default_factory=list)
     deferred: bool = False
+    defer_kwargs: dict = field(default_factory=dict)
     done: bool = False
 
     async def send_message(self, content=None, **kwargs):
@@ -54,7 +55,7 @@ class FakeResponse:
         self.edits.append(kwargs)
 
     async def defer(self, **kwargs):
-        self.deferred, self.done = True, True
+        self.deferred, self.defer_kwargs, self.done = True, kwargs, True
 
     def is_done(self):
         return self.done
@@ -64,24 +65,24 @@ def fake_interaction(user_id, administrator, guild=None):
     permissions = SimpleNamespace(administrator=administrator)
     guild = guild if guild is not None else FakeGuild(1)
     followup = FakeResponse()
-    return SimpleNamespace(
+    interaction = SimpleNamespace(
         user=SimpleNamespace(id=user_id, guild_permissions=permissions),
         response=FakeResponse(),
         files=[],
         guild=guild,
         followup=followup,
+        original_edits=[],
     )
-
-
-def fake_deferred_interaction(user_id, administrator, guild=None):
-    interaction = fake_interaction(user_id, administrator, guild)
-    interaction.original_edits = []
 
     async def edit_original_response(**kwargs):
         interaction.original_edits.append(kwargs)
 
     interaction.edit_original_response = edit_original_response
     return interaction
+
+
+def fake_deferred_interaction(user_id, administrator, guild=None):
+    return fake_interaction(user_id, administrator, guild)
 
 
 def fake_button():
