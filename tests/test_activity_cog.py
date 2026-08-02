@@ -2441,6 +2441,58 @@ class SodEodCollectionTests(unittest.IsolatedAsyncioTestCase):
         guild.fetch_member.assert_awaited_once_with(member.id)
         self.assertEqual(self.count_events(cog), 2)
 
+    async def test_backfill_rechecks_cached_member_role_removal_each_message(self):
+        cog, guild, member = self.make_fixture()
+        channel = fake_text_channel(40, guild)
+
+        async def history(**kwargs):
+            yield self.full_message(40, member, channel)
+            guild.members = [member.with_roles(set())]
+            yield self.full_message(41, member, channel)
+
+        channel.history.side_effect = history
+
+        result = await cog.backfill_current_channel(guild, channel=channel)
+
+        self.assertEqual(result.processed_count, 2)
+        self.assertEqual(result.event_count, 1)
+        with closing(sqlite3.connect(cog.store.db_path)) as conn:
+            message_ids = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT message_id FROM sod_eod_events ORDER BY message_id"
+                )
+            ]
+        self.assertEqual(message_ids, [40])
+        self.assertEqual((await sync_state(cog, 40)).newest_processed_message_id, 41)
+
+    async def test_backfill_rechecks_cached_member_role_addition_each_message(self):
+        cog, guild, member = self.make_fixture()
+        roleless_member = member.with_roles(set())
+        guild.members = [roleless_member]
+        channel = fake_text_channel(40, guild)
+
+        async def history(**kwargs):
+            yield self.full_message(42, roleless_member, channel)
+            guild.members = [member]
+            yield self.full_message(43, roleless_member, channel)
+
+        channel.history.side_effect = history
+
+        result = await cog.backfill_current_channel(guild, channel=channel)
+
+        self.assertEqual(result.processed_count, 2)
+        self.assertEqual(result.event_count, 1)
+        with closing(sqlite3.connect(cog.store.db_path)) as conn:
+            message_ids = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT message_id FROM sod_eod_events ORDER BY message_id"
+                )
+            ]
+        self.assertEqual(message_ids, [43])
+        self.assertEqual((await sync_state(cog, 40)).newest_processed_message_id, 43)
+
     async def test_backfill_history_interruption_resumes_at_last_committed_message(self):
         cog, guild, member = self.make_fixture()
         channel = fake_text_channel(40, guild)

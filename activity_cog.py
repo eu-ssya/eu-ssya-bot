@@ -564,19 +564,22 @@ class ActivityCog(commands.Cog):
                 after=after,
             ):
                 author_id = message.author.id
-                try:
-                    eligible_author = author_eligibility.pop(author_id)
-                except KeyError:
-                    member = guild.get_member(author_id)
-                    if member is None:
+                member = guild.get_member(author_id)
+                if member is not None:
+                    author_eligibility.pop(author_id, None)
+                    eligible_author = self._member_has_target_role(member, config)
+                else:
+                    try:
+                        eligible_author = author_eligibility.pop(author_id)
+                    except KeyError:
                         try:
                             member = await guild.fetch_member(author_id)
                         except (discord.NotFound, discord.Forbidden):
                             member = None
-                    eligible_author = self._member_has_target_role(member, config)
-                author_eligibility[author_id] = eligible_author
-                if len(author_eligibility) > AUTHOR_ELIGIBILITY_CACHE_LIMIT:
-                    author_eligibility.popitem(last=False)
+                        eligible_author = self._member_has_target_role(member, config)
+                    author_eligibility[author_id] = eligible_author
+                    if len(author_eligibility) > AUTHOR_ELIGIBILITY_CACHE_LIMIT:
+                        author_eligibility.popitem(last=False)
 
                 event_types = set()
                 if (
