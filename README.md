@@ -107,7 +107,7 @@ fly secrets set DISCORD_BOT_TOKEN="실제_토큰" -a eu-ssya-bot
 | `/모임통장 출금 금액:<int> [메모] [날짜]` | 잔액을 넘지 않는 출금 기록 |
 | `/모임통장 관리` | 거래 수정·삭제 UI 열기 |
 
-날짜는 `YYYY-MM-DD`이며 생략하면 KST 오늘을 사용합니다. 모임통장 명령은 Discord Administrator만 실행할 수 있습니다.
+날짜는 `YYYY-MM-DD` 또는 `YYYYMMDD` 형식이며 생략하면 KST 오늘을 사용합니다. 모임통장 명령은 Discord Administrator만 실행할 수 있습니다.
 
 ### 활동 설정과 보고서
 

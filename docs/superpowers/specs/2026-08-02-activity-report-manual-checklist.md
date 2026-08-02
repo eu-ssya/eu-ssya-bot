@@ -63,6 +63,9 @@ function Get-SoleFlyStorage([string]$AppName) {
     if ($machineIds.Count -ne 1) {
         throw "Expected exactly one Fly Machine, found $($machineIds.Count)"
     }
+    if ([string]$machines[0].state -cne "started") {
+        throw "Expected the sole Fly Machine to be running (state=started), found $($machines[0].state)"
+    }
 
     $volumes = @(fly volumes list -a $AppName --json | ConvertFrom-Json)
     if ($volumes.Count -ne 1) {
@@ -78,6 +81,7 @@ function Get-SoleFlyStorage([string]$AppName) {
 
     [pscustomobject]@{
         MachineId = $machineIds[0]
+        MachineState = [string]$machines[0].state
         VolumeId = [string]$volume.id
         VolumeName = [string]$volume.name
         AttachedMachineId = [string]$volume.attached_machine_id
@@ -88,7 +92,7 @@ $machineId = $topology.MachineId
 $topology | Format-List
 ```
 
-- [ ] JSON 검사 결과 실제 Machine ID가 정확히 하나다.
+- [ ] JSON 검사 결과 실제 Machine ID가 정확히 하나이고 `state=started`(실행 중)다.
 - [ ] JSON 검사 결과 volume이 정확히 하나이고 이름은 `bot_data`다.
 - [ ] JSON의 `attached_machine_id`가 `$machineId`와 정확히 같고 mount destination은 배포 구성의 `/data`다.
 - [ ] Machine 하나와 volume 하나 제약을 유지한다. scale-out, volume 추가/복제, destroy/force 명령을 사용하지 않는다.
@@ -134,83 +138,224 @@ $topology | Format-List
 
 ## 6. restart 전 SQLite snapshot — 외부, 미실행
 
-`sqlite3` CLI 설치를 가정하지 않는다. 컨테이너의 Python 표준 라이브러리를 사용하고, SSH 대상은 반드시 검증한 `$machineId`로 고정한다.
+`sqlite3` CLI 설치를 가정하지 않는다. 컨테이너의 Python 표준 라이브러리를 사용하고, SSH 대상은 반드시 검증한 `$machineId`로 고정한다. restart는 열린 `voice_sessions`와 `voice_collection_runs`를 정상 종료하고 현재 Discord 상태를 새 열린 행으로 reconcile하므로 두 음성 테이블은 전체 checksum 동일성을 요구하면 안 된다.
+
+먼저 운영 모드를 선택한다.
+
+- `PAUSED`(권장): 설정 변경, backfill, SoD/EoD 메시지, 음성 입·이동·퇴장을 멈춘다. 지정 테스트 멤버 한 명은 감시 음성 채널에 그대로 연결해 둔다.
+- `ACTIVE`: 일반 사용자 트래픽을 멈출 수 없는 경우다. 설정 명령과 backfill만은 중단하고, 발생한 SoD/EoD·음성 이벤트를 별도 기록한다. 이 모드는 더 약한 append-only/voice 전이 증명임을 결과에 남긴다.
 
 ```powershell
-$snapshotCode = 'import os,sqlite3,hashlib,json; p="/data/activity.db"; assert os.path.isfile(p), "activity.db missing"; c=sqlite3.connect("file:"+p+"?mode=ro",uri=True); ts=("activity_config","voice_sessions","voice_collection_runs","sod_eod_events","sod_eod_daily","activity_sync_state","sod_eod_channel_periods"); rows=[(t,c.execute("select * from "+t+" order by rowid").fetchall()) for t in ts]; print(json.dumps({"exists":1,"counts":{t:len(r) for t,r in rows},"checksum":hashlib.sha256(repr(rows).encode()).hexdigest()},sort_keys=True))'
+$trafficMode = (Read-Host "Type PAUSED (recommended) or ACTIVE").ToUpperInvariant()
+if ($trafficMode -notin @("PAUSED", "ACTIVE")) { throw "Invalid traffic mode" }
+
+$snapshotCode = @'
+import hashlib
+import json
+import os
+import sqlite3
+import time
+
+p = "/data/activity.db"
+assert os.path.isfile(p), "activity.db missing"
+c = sqlite3.connect("file:" + p + "?mode=ro", uri=True)
+c.row_factory = sqlite3.Row
+
+def rows(table):
+    return [dict(row) for row in c.execute("select * from " + table + " order by rowid")]
+
+def digest(value):
+    raw = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+stable_names = ("activity_config", "activity_sync_state", "sod_eod_channel_periods")
+append_names = ("sod_eod_events", "sod_eod_daily")
+stable = {name: rows(name) for name in stable_names}
+append_only = {name: rows(name) for name in append_names}
+result = {
+    "exists": 1,
+    "captured_epoch": int(time.time()),
+    "stable": stable,
+    "stable_counts": {name: len(value) for name, value in stable.items()},
+    "stable_checksum": digest(stable),
+    "append_only": append_only,
+    "append_counts": {name: len(value) for name, value in append_only.items()},
+    "append_checksum": digest(append_only),
+    "voice_sessions": rows("voice_sessions"),
+    "voice_collection_runs": rows("voice_collection_runs"),
+}
+print(json.dumps(result, ensure_ascii=False, separators=(",", ":"), sort_keys=True))
+'@
 $snapshotBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($snapshotCode))
 $snapshotCommand = "python -c `"import base64;exec(base64.b64decode('$snapshotBase64'))`""
 $beforeLine = fly ssh console -a $App --machine $machineId -C $snapshotCommand | Select-Object -Last 1
 $before = $beforeLine | ConvertFrom-Json
-$before | ConvertTo-Json -Depth 4
+$before | ConvertTo-Json -Depth 12
 if ([int]$before.exists -ne 1) { throw "Pre-restart activity.db does not exist" }
 ```
 
-- [ ] `$before.exists`가 `1`이다.
-- [ ] 모든 테이블 count와 checksum을 변경 불가능한 작업 기록에 저장했다.
+- [ ] `$before.exists`가 `1`이고 snapshot JSON 전체를 변경 불가능한 작업 기록에 저장했다.
+- [ ] `PAUSED` 모드라면 `$before.voice_sessions`에 지정 테스트 멤버의 열린 행이, `$before.voice_collection_runs`에 열린 run이 최소 하나 있다.
 - [ ] WAL/SHM 파일은 checkpoint 뒤 없어질 수 있으므로 그 존재 자체를 영속성 판정 기준으로 사용하지 않았다.
 
 ## 7. 명시적 결정 뒤 정확한 ID 하나만 restart — 외부, 미실행
 
-restart는 서비스 중단을 일으키는 운영 작업이다. 테스트 트래픽을 멈추고 담당자가 명시적으로 승인한 경우에만 실행한다. destroy, force, 전체/복수 Machine 대상 명령은 사용하지 않는다.
+restart는 서비스 중단을 일으키는 운영 작업이다. 담당자가 선택한 traffic mode와 중단 영향을 확인한 경우에만 실행한다. destroy, force, 전체/복수 Machine 대상 명령은 사용하지 않는다.
 
 ```powershell
-$decision = Read-Host "Traffic is paused. Type RESTART to restart only $machineId"
+$decision = Read-Host "Mode=$trafficMode. Type RESTART to restart only $machineId"
 if ($decision -cne "RESTART") { throw "Restart not approved" }
 fly machine restart $machineId -a $App
 ```
 
-- [ ] 담당자가 트래픽 중단과 restart를 명시적으로 승인했다.
+- [ ] 담당자가 traffic mode, 서비스 중단과 restart를 명시적으로 승인했다.
 - [ ] JSON으로 검증한 정확한 `$machineId` 하나만 restart했다.
-- [ ] restart 완료와 Machine 정상 실행을 확인했다.
+- [ ] restart 완료 뒤 topology 검사에서 Machine이 여전히 정확히 하나이고 `state=started`다.
 
-## 8. restart 후 snapshot과 판정 — 외부, 미실행
+## 8. restart 후 snapshot과 lifecycle 판정 — 외부, 미실행
 
 ```powershell
 $afterLine = fly ssh console -a $App --machine $machineId -C $snapshotCommand | Select-Object -Last 1
 $after = $afterLine | ConvertFrom-Json
-$after | ConvertTo-Json -Depth 4
+$after | ConvertTo-Json -Depth 12
 if ([int]$after.exists -ne 1) { throw "Post-restart activity.db does not exist" }
 ```
 
-트래픽을 멈춘 기본 판정은 모든 테이블 count와 논리 데이터 checksum의 정확한 일치다.
+설정·sync·channel period는 restart가 바꾸지 않으므로 traffic mode와 무관하게 count와 checksum이 정확히 같아야 한다.
 
 ```powershell
-$tables = @("activity_config", "voice_sessions", "voice_collection_runs", "sod_eod_events", "sod_eod_daily", "activity_sync_state", "sod_eod_channel_periods")
-$countMismatch = @()
-foreach ($table in $tables) {
-    $beforeCount = [int64]$before.counts.PSObject.Properties[$table].Value
-    $afterCount = [int64]$after.counts.PSObject.Properties[$table].Value
-    if ($afterCount -ne $beforeCount) {
-        $countMismatch += "$table ($beforeCount -> $afterCount)"
-    }
+$stableTables = @("activity_config", "activity_sync_state", "sod_eod_channel_periods")
+foreach ($table in $stableTables) {
+    $beforeCount = [int64]$before.stable_counts.PSObject.Properties[$table].Value
+    $afterCount = [int64]$after.stable_counts.PSObject.Properties[$table].Value
+    if ($afterCount -ne $beforeCount) { throw "Stable table count changed: $table" }
 }
-if ($countMismatch.Count -ne 0 -or $before.checksum -ne $after.checksum) {
-    throw "SQLite persistence mismatch: counts=$($countMismatch -join ', ') checksum=$($before.checksum)->$($after.checksum)"
+if ($before.stable_checksum -cne $after.stable_checksum) {
+    throw "Stable table checksum changed"
 }
 ```
 
-- [ ] 트래픽을 멈춘 경우 before/after의 모든 count와 checksum이 정확히 같다.
-
-트래픽을 멈출 수 없었다면 정확한 checksum 일치 대신 모든 테이블 count가 감소하지 않았는지 확인한다. 이 fallback은 테스트 중 발생한 정상 이벤트와 변경된 checksum을 함께 기록해야 하며, 행 수정·삭제의 완전한 무결성 증명은 아니라는 한계를 남긴다.
+SoD/EoD 테이블은 `PAUSED`에서는 exact count/checksum을 요구한다. `ACTIVE`에서는 기존 row가 같은 rowid 순서의 prefix로 모두 보존되고 새 row만 뒤에 추가되는지 확인한다. 이는 restart에 의한 정상 음성 행 변경과 사용자 메시지로 인한 append를 구분한다.
 
 ```powershell
-$decreased = @()
-foreach ($table in $tables) {
-    $beforeCount = [int64]$before.counts.PSObject.Properties[$table].Value
-    $afterCount = [int64]$after.counts.PSObject.Properties[$table].Value
-    if ($afterCount -lt $beforeCount) {
-        $decreased += "$table ($beforeCount -> $afterCount)"
+$appendTables = @("sod_eod_events", "sod_eod_daily")
+if ($trafficMode -ceq "PAUSED") {
+    foreach ($table in $appendTables) {
+        $beforeCount = [int64]$before.append_counts.PSObject.Properties[$table].Value
+        $afterCount = [int64]$after.append_counts.PSObject.Properties[$table].Value
+        if ($afterCount -ne $beforeCount) { throw "Paused append-only count changed: $table" }
     }
+    if ($before.append_checksum -cne $after.append_checksum) {
+        throw "Paused append-only checksum changed"
+    }
+} else {
+    foreach ($table in $appendTables) {
+        $beforeRows = @($before.append_only.PSObject.Properties[$table].Value)
+        $afterRows = @($after.append_only.PSObject.Properties[$table].Value)
+        if ($afterRows.Count -lt $beforeRows.Count) { throw "Append-only table shrank: $table" }
+        for ($i = 0; $i -lt $beforeRows.Count; $i++) {
+            $beforeJson = $beforeRows[$i] | ConvertTo-Json -Compress -Depth 5
+            $afterJson = $afterRows[$i] | ConvertTo-Json -Compress -Depth 5
+            if ($beforeJson -cne $afterJson) { throw "Existing append-only row changed: $table index=$i" }
+        }
+    }
+    Write-Warning "ACTIVE fallback used; record expected SoD/EoD events and append checksums"
 }
-if ($decreased.Count -ne 0) {
-    throw "SQLite count decreased: $($decreased -join ', ')"
-}
-Write-Warning "Active-traffic fallback used; record expected events and checksums: before=$($before.checksum) after=$($after.checksum)"
 ```
 
-- [ ] 트래픽 활성 fallback을 쓴 경우 모든 after count가 before 이상이고, 그 사이 예상한 이벤트와 달라진 checksum을 기록했다.
-- [ ] 아래 JSON 재검증으로 restart 뒤에도 정확히 한 Machine과 그 ID에 연결된 `bot_data` 하나를 재확인했다.
+음성 테이블은 restart lifecycle을 별도로 검증한다. 기존 closed row는 그대로 보존되어야 한다. restart 전 open row는 같은 ID로 보존되어 정상 종료되어야 하며, hard-recovery면 `restart_checkpoint`와 checkpoint 시각, graceful/disconnect 경로면 허용된 사유와 checkpoint 이후 종료 시각을 가져야 한다. 유효 설정의 guild에는 새 열린 run이 생긴다. `PAUSED`에서 감시 채널에 그대로 둔 테스트 멤버는 같은 guild/user/kind의 새 열린 session이 생긴다.
+
+```powershell
+function Row-Json($row) { $row | ConvertTo-Json -Compress -Depth 5 }
+function Find-ById($rows, [int64]$id) {
+    $found = @($rows | Where-Object { [int64]$_.id -eq $id })
+    if ($found.Count -ne 1) { throw "Expected one preserved row id=$id, found $($found.Count)" }
+    $found[0]
+}
+function Assert-ClosedTransition($beforeRow, $afterRow, [string]$reasonField, [string[]]$allowedReasons) {
+    foreach ($field in @("id", "guild_id", "started_epoch")) {
+        if ([string]$beforeRow.$field -cne [string]$afterRow.$field) { throw "Voice row field changed: id=$($beforeRow.id) field=$field" }
+    }
+    if ($beforeRow.PSObject.Properties["user_id"]) {
+        foreach ($field in @("user_id", "activity_kind")) {
+            if ([string]$beforeRow.$field -cne [string]$afterRow.$field) { throw "Voice session identity changed: id=$($beforeRow.id) field=$field" }
+        }
+    }
+    $reason = [string]$afterRow.$reasonField
+    if ($reason -notin $allowedReasons) { throw "Unexpected close reason: id=$($beforeRow.id) reason=$reason" }
+    if ($null -eq $afterRow.ended_epoch) { throw "Prior open row is still open: id=$($beforeRow.id)" }
+    if ([int64]$afterRow.last_checkpoint_epoch -lt [int64]$beforeRow.last_checkpoint_epoch) {
+        throw "Checkpoint regressed: id=$($beforeRow.id)"
+    }
+    if ($reason -ceq "restart_checkpoint" -and [int64]$afterRow.ended_epoch -ne [int64]$afterRow.last_checkpoint_epoch) {
+        throw "restart_checkpoint must close at checkpoint: id=$($beforeRow.id)"
+    }
+    if ($reason -cne "restart_checkpoint" -and [int64]$afterRow.ended_epoch -lt [int64]$afterRow.last_checkpoint_epoch) {
+        throw "Close precedes checkpoint: id=$($beforeRow.id)"
+    }
+}
+function Assert-NewOpen($row, [string]$reasonField) {
+    if ($null -ne $row.ended_epoch -or $null -ne $row.$reasonField) { throw "Replacement row is not open: id=$($row.id)" }
+    if ([int64]$row.started_epoch -lt [int64]$before.captured_epoch -or [int64]$row.started_epoch -gt [int64]$after.captured_epoch) {
+        throw "Replacement row start is outside restart window: id=$($row.id)"
+    }
+    if ([int64]$row.last_checkpoint_epoch -lt [int64]$row.started_epoch) { throw "Replacement checkpoint precedes start: id=$($row.id)" }
+}
+
+$beforeSessions = @($before.voice_sessions)
+$afterSessions = @($after.voice_sessions)
+$beforeRuns = @($before.voice_collection_runs)
+$afterRuns = @($after.voice_collection_runs)
+$beforeSessionIds = @($beforeSessions | ForEach-Object { [int64]$_.id })
+$beforeRunIds = @($beforeRuns | ForEach-Object { [int64]$_.id })
+$beforeOpenSessions = @($beforeSessions | Where-Object { $null -eq $_.ended_epoch })
+$beforeOpenRuns = @($beforeRuns | Where-Object { $null -eq $_.ended_epoch })
+
+foreach ($row in @($beforeSessions | Where-Object { $null -ne $_.ended_epoch })) {
+    if ((Row-Json $row) -cne (Row-Json (Find-ById $afterSessions ([int64]$row.id)))) { throw "Closed session changed: id=$($row.id)" }
+}
+foreach ($row in @($beforeRuns | Where-Object { $null -ne $_.ended_epoch })) {
+    if ((Row-Json $row) -cne (Row-Json (Find-ById $afterRuns ([int64]$row.id)))) { throw "Closed run changed: id=$($row.id)" }
+}
+$sessionCloseReasons = @("restart_checkpoint", "reconciled", "gateway_disconnect")
+if ($trafficMode -ceq "ACTIVE") {
+    $sessionCloseReasons += @("normal", "category_change", "role_removed")
+}
+foreach ($row in $beforeOpenSessions) {
+    Assert-ClosedTransition $row (Find-ById $afterSessions ([int64]$row.id)) "closed_reason" $sessionCloseReasons
+}
+foreach ($row in $beforeOpenRuns) {
+    Assert-ClosedTransition $row (Find-ById $afterRuns ([int64]$row.id)) "ended_reason" @("restart_checkpoint", "graceful_shutdown", "gateway_disconnect")
+}
+
+$newOpenRuns = @($afterRuns | Where-Object { $null -eq $_.ended_epoch -and ([int64]$_.id -notin $beforeRunIds) })
+foreach ($prior in $beforeOpenRuns) {
+    $replacement = @($newOpenRuns | Where-Object { [int64]$_.guild_id -eq [int64]$prior.guild_id })
+    if ($replacement.Count -ne 1) { throw "Expected one new open run for guild $($prior.guild_id)" }
+    Assert-NewOpen $replacement[0] "ended_reason"
+}
+
+if ($trafficMode -ceq "PAUSED") {
+    if ($beforeOpenRuns.Count -eq 0 -or $beforeOpenSessions.Count -eq 0) { throw "PAUSED smoke requires a pre-restart open run and test session" }
+    $newOpenSessions = @($afterSessions | Where-Object { $null -eq $_.ended_epoch -and ([int64]$_.id -notin $beforeSessionIds) })
+    foreach ($prior in $beforeOpenSessions) {
+        $replacement = @($newOpenSessions | Where-Object {
+            [int64]$_.guild_id -eq [int64]$prior.guild_id -and
+            [int64]$_.user_id -eq [int64]$prior.user_id -and
+            [string]$_.activity_kind -ceq [string]$prior.activity_kind
+        })
+        if ($replacement.Count -ne 1) { throw "Expected one replacement open session for user $($prior.user_id)" }
+        Assert-NewOpen $replacement[0] "closed_reason"
+    }
+} else {
+    Write-Warning "ACTIVE fallback: session replacements follow live Discord state; record observed moves/leaves and resulting new open sessions"
+}
+```
+
+- [ ] stable 테이블은 exact count/checksum, SoD/EoD는 선택한 mode의 exact 또는 append-only 보존 규칙을 통과했다.
+- [ ] 기존 closed 음성 행은 불변이고 기존 open 음성 행은 정상 사유/시각으로 종료되었다.
+- [ ] 유효 guild의 새 open run과 `PAUSED` 테스트 멤버의 새 open session을 확인했다. `ACTIVE`면 실제 음성 이벤트와 결과를 기록했다.
+- [ ] 아래 JSON 재검증으로 restart 뒤에도 정확히 한 실행 중 Machine과 그 ID에 연결된 `bot_data` 하나를 재확인했다.
 
 ```powershell
 $topology = Get-SoleFlyStorage $App
