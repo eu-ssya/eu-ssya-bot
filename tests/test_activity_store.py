@@ -1229,7 +1229,7 @@ class ReportStoreTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_zero_member_sort_and_positive_overlap_count(self):
+    def test_voice_only_member_ranks_by_voice_but_keeps_activity_days_zero(self):
         members = [
             activity_store.ReportMember(1, "Zulu"),
             activity_store.ReportMember(2, "Alpha"),
@@ -1248,12 +1248,96 @@ class ReportStoreTests(unittest.TestCase):
             as_of_epoch=200,
         )
 
-        self.assertEqual([row.user_id for row in report.rows], [2, 1, 3])
+        self.assertEqual([row.user_id for row in report.rows], [3, 2, 1])
+        voice_only = report.rows[0]
         self.assertEqual(
-            (report.rows[-1].study_seconds, report.rows[-1].study_session_count),
-            (60, 1),
+            (
+                voice_only.study_seconds,
+                voice_only.study_session_count,
+                voice_only.combined_days,
+            ),
+            (60, 1, 0),
         )
-        self.assertEqual(report.rows[0].last_activity_epoch, None)
+
+    def test_report_ranking_applies_every_tie_break_in_order(self):
+        previous_start, _ = kst_range_to_epoch(date(2026, 7, 31), date(2026, 7, 31))
+        start_epoch, end_epoch = kst_range_to_epoch(
+            date(2026, 8, 1), date(2026, 8, 2)
+        )
+        self.store.apply_config_change(
+            1, sod_eod_channel_id=10, effective_at_epoch=previous_start
+        )
+
+        message_id = 1
+
+        def record(user_id, created_epoch):
+            nonlocal message_id
+            self.store.record_live_message(
+                guild_id=1,
+                channel_id=10,
+                message_id=message_id,
+                user_id=user_id,
+                message_created_epoch=created_epoch,
+                event_types={"sod"},
+                updated_epoch=created_epoch,
+                expected_current_channel_id=10,
+            )
+            message_id += 1
+
+        # user 1: 활동일 2일. 다른 모든 tie-break보다 먼저 온다.
+        record(1, start_epoch + 10)
+        record(1, start_epoch + 86400 + 10)
+
+        # users 2~6: 활동일 1일. 이후 키를 독립적으로 비교한다.
+        for user_id in (2, 3, 4, 5, 6):
+            record(user_id, start_epoch + 10)
+
+        # user 2: 합산 음성 120초로 users 3~6보다 먼저 온다.
+        self.store.reconcile_session(1, 2, "study", start_epoch + 100)
+        self.store.reconcile_session(
+            1, 2, None, start_epoch + 220, close_reason="normal"
+        )
+
+        # user 3: 합산 음성은 60초로 같지만 최근 활동이 users 4~6보다 늦다.
+        self.store.reconcile_session(1, 3, "reading_room", start_epoch + 200)
+        self.store.reconcile_session(
+            1, 3, None, start_epoch + 260, close_reason="normal"
+        )
+
+        # users 4~6: 활동일·음성·최근 활동까지 같아 이름과 ID로 정렬한다.
+        for user_id in (4, 5, 6):
+            self.store.reconcile_session(1, user_id, "study", start_epoch + 100)
+            self.store.reconcile_session(
+                1, user_id, None, start_epoch + 160, close_reason="normal"
+            )
+
+        # user 7은 조회 범위 밖 보존 활동이 있고, user 8은 활동이 전혀 없다.
+        record(7, previous_start + 10)
+
+        report = self.store.build_report(
+            guild_id=1,
+            members=[
+                activity_store.ReportMember(8, "No activity"),
+                activity_store.ReportMember(5, "Beta"),
+                activity_store.ReportMember(6, "alpha"),
+                activity_store.ReportMember(4, "Alpha"),
+                activity_store.ReportMember(3, "Recent"),
+                activity_store.ReportMember(2, "Voice"),
+                activity_store.ReportMember(1, "Days"),
+                activity_store.ReportMember(7, "Old record"),
+            ],
+            start_epoch=start_epoch,
+            end_epoch=end_epoch,
+            as_of_epoch=end_epoch,
+        )
+
+        self.assertEqual(
+            [row.user_id for row in report.rows],
+            [1, 2, 3, 4, 6, 5, 7, 8],
+        )
+        self.assertEqual(report.rows[-2].combined_days, 0)
+        self.assertIsNotNone(report.rows[-2].last_activity_epoch)
+        self.assertIsNone(report.rows[-1].last_activity_epoch)
 
     def test_exact_boundaries_count_only_positive_overlap_sessions(self):
         self.store.reconcile_session(1, 3, "study", 50)
@@ -1342,9 +1426,9 @@ class ReportStoreTests(unittest.TestCase):
             as_of_epoch=700,
         )
 
-        self.assertEqual([row.user_id for row in report.rows], [2, 4, 3])
+        self.assertEqual([row.user_id for row in report.rows], [3, 4, 2])
         self.assertEqual(
-            [row.last_activity_epoch for row in report.rows], [None, 700, 700]
+            [row.last_activity_epoch for row in report.rows], [700, 700, None]
         )
 
     def test_daily_counts_are_distinct_and_combined_days_are_a_union(self):

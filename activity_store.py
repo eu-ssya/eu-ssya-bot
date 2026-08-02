@@ -945,8 +945,10 @@ class ActivityStore:
 
         rows.sort(
             key=lambda row: (
-                row.last_activity_epoch is not None,
-                row.last_activity_epoch or 0,
+                -row.combined_days,
+                -(row.reading_seconds + row.study_seconds),
+                row.last_activity_epoch is None,
+                -(row.last_activity_epoch or 0),
                 row.display_name.casefold(),
                 row.user_id,
             )
