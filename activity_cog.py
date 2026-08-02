@@ -373,11 +373,8 @@ class ActivityCog(commands.Cog):
             expected_generation is not None
             and self._collection_generations[guild.id] != expected_generation
         ):
-            await self._store_call(
-                self.store.abort_full_reconcile,
-                guild.id,
-                effective_at_epoch=effective_at_epoch,
-            )
+            # The newer lifecycle owner also acquires this guild lock and must
+            # close or reconcile rows at its own epoch; stale owners never sweep.
             self.dirty_guilds.add(guild.id)
             return config, warnings
         self.dirty_guilds.discard(guild.id)

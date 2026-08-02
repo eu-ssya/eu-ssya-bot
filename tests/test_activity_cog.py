@@ -1066,6 +1066,91 @@ class RecoveryLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(await run_checkpoint(cog, guild.id))
 
+    async def _disconnect_after_reconcile_observes_open_rows(
+        self,
+        cog,
+        guild,
+        lifecycle_callback,
+    ):
+        store_entered = threading.Event()
+        release_store = threading.Event()
+        original_list_open = cog.store.list_open_session_user_ids
+
+        def pause_after_observing_open_rows(guild_id):
+            result = original_list_open(guild_id)
+            store_entered.set()
+            release_store.wait(5)
+            return result
+
+        with mock.patch.object(
+            cog.store,
+            "list_open_session_user_ids",
+            side_effect=pause_after_observing_open_rows,
+        ):
+            with mock.patch("activity_cog.utc_now_epoch", return_value=200):
+                lifecycle = asyncio.create_task(lifecycle_callback())
+                while not store_entered.is_set():
+                    await asyncio.sleep(0)
+            with mock.patch("activity_cog.utc_now_epoch", return_value=220):
+                disconnect = asyncio.create_task(cog.on_disconnect())
+                await asyncio.sleep(0)
+                self.assertFalse(cog.collection_gates[guild.id].is_set())
+                release_store.set()
+                await asyncio.gather(lifecycle, disconnect)
+
+    async def test_disconnect_owns_existing_rows_after_stale_guild_available(self):
+        cog, guild, member = self.make_cog()
+        await recover_after_ready_for_test(cog, 100)
+        await cog._store_call(cog.store.checkpoint_open_rows, guild.id, 120)
+
+        await self._disconnect_after_reconcile_observes_open_rows(
+            cog,
+            guild,
+            lambda: cog.on_guild_available(guild),
+        )
+
+        self.assertEqual(
+            await session_rows(cog, member.id),
+            [("reading_room", 100, 220, "gateway_disconnect")],
+        )
+        self.assertEqual(
+            await cog._store_call(cog.store.list_runs, guild.id),
+            [
+                (1, 1, 1, "restart_checkpoint"),
+                (100, 120, 220, "gateway_disconnect"),
+            ],
+        )
+        self.assertFalse(cog.collection_gates[guild.id].is_set())
+        self.assertEqual(cog._disconnect_epochs, {guild.id: 220})
+
+    async def test_disconnect_cleans_rows_opened_by_stale_resume(self):
+        cog, guild, member = self.make_cog()
+        await recover_after_ready_for_test(cog, 100)
+
+        await self._disconnect_after_reconcile_observes_open_rows(
+            cog,
+            guild,
+            cog.on_resumed,
+        )
+
+        self.assertEqual(
+            await session_rows(cog, member.id),
+            [
+                ("reading_room", 100, 100, "restart_checkpoint"),
+                ("reading_room", 200, 220, "gateway_disconnect"),
+            ],
+        )
+        self.assertEqual(
+            await cog._store_call(cog.store.list_runs, guild.id),
+            [
+                (1, 1, 1, "restart_checkpoint"),
+                (100, 100, 100, "restart_checkpoint"),
+                (200, 200, 220, "gateway_disconnect"),
+            ],
+        )
+        self.assertFalse(cog.collection_gates[guild.id].is_set())
+        self.assertEqual(cog._disconnect_epochs, {guild.id: 220})
+
     async def test_hard_restart_closes_at_checkpoint_and_starts_fresh_at_now(self):
         cog, guild, member = self.make_cog()
         await cog._store_call(
