@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import io
 import logging
 import os
@@ -6,13 +7,21 @@ import re
 import sqlite3
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from activity_store import ActivityStore, ChannelChanged
+from activity_store import (
+    ActivityReport,
+    ActivityStore,
+    ChannelChanged,
+    KST,
+    ReportMember,
+    ReportRow,
+    kst_range_to_epoch,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -20,6 +29,9 @@ logger = logging.getLogger(__name__)
 
 SOD_EOD_PATTERN = re.compile(r"(?<![a-z0-9])(sod|eod)(?![a-z0-9])")
 AUTHOR_ELIGIBILITY_CACHE_LIMIT = 64
+REPORT_PAGE_SIZE = 15
+REPORT_CONTENT_LIMIT = 1900
+REPORT_VIEW_TIMEOUT_SECONDS = 600
 
 
 def detect_sod_eod(content: str) -> set[str]:
@@ -52,10 +64,250 @@ async def require_admin(interaction) -> bool:
     return False
 
 
+def _strict_iso_date(value: str) -> date:
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) is None:
+        raise ValueError("날짜는 YYYY-MM-DD 형식이어야 합니다.")
+    try:
+        return date.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError("날짜는 유효한 YYYY-MM-DD 형식이어야 합니다.") from error
+
+
+def _clean_display_name(value: str, limit: int) -> str:
+    cleaned = " ".join(str(value).split()) or "이름 없음"
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: max(1, limit - 1)] + "…"
+
+
+def _format_timestamp(epoch: int | None, target_timezone) -> str:
+    if epoch is None:
+        return "기록 없음"
+    return datetime.fromtimestamp(epoch, target_timezone).strftime(
+        "%Y-%m-%d %H:%M:%S %Z"
+    )
+
+
+def _warning_summary_lines(
+    report: ActivityReport,
+    *,
+    character_limit: int = 320,
+) -> list[str]:
+    if not report.warnings:
+        return ["경고: 없음"]
+    lines = ["경고:"]
+    used = len(lines[0])
+    for index, warning in enumerate(report.warnings):
+        line = f"- {warning.text}"
+        remaining = len(report.warnings) - index
+        omitted = f"- 그 외 {remaining}건은 전체 TXT를 확인해 주세요."
+        if used + 1 + len(line) > character_limit:
+            lines.append(omitted)
+            break
+        lines.append(line)
+        used += 1 + len(line)
+    return lines
+
+
+def _page_row_line(row: ReportRow, *, compact: bool) -> str:
+    name = _clean_display_name(row.display_name, 7 if compact else 12)
+    if compact:
+        last = "없음" if row.last_activity_epoch is None else str(row.last_activity_epoch)
+        return (
+            f"[{row.user_id}] {name} | {last} | "
+            f"{row.reading_seconds}/{row.reading_session_count} | "
+            f"{row.study_seconds}/{row.study_session_count} | "
+            f"{row.sod_days}/{row.eod_days}/{row.combined_days}"
+        )
+    return (
+        f"[{row.user_id}] {name} | 최근 {_format_timestamp(row.last_activity_epoch, KST)} | "
+        f"독서 {row.reading_seconds}초/{row.reading_session_count}회 | "
+        f"스터디 {row.study_seconds}초/{row.study_session_count}회 | "
+        f"SoD {row.sod_days} EoD {row.eod_days} 통합 {row.combined_days}"
+    )
+
+
+def format_report_page(report: ActivityReport, page_index: int) -> str:
+    page_count = max(1, report.page_count)
+    page_index = min(max(0, page_index), page_count - 1)
+    start = page_index * REPORT_PAGE_SIZE
+    rows = report.rows[start : start + REPORT_PAGE_SIZE]
+    warning_lines = _warning_summary_lines(report)
+    header = [
+        "활동 현황 보고서",
+        report.period_label,
+        f"생성 KST: {_format_timestamp(report.generated_epoch, KST)}",
+        f"페이지: {page_index + 1}/{page_count}",
+    ]
+    if rows:
+        body = [_page_row_line(row, compact=False) for row in rows]
+    else:
+        body = ["표시할 대상 멤버가 없습니다."]
+    content = "\n".join(header + body + warning_lines)
+    if len(content) <= REPORT_CONTENT_LIMIT:
+        return content
+
+    compact_header = header + [
+        "ID 이름 | 최근활동(epoch) | 독서(초/회) | 스터디(초/회) | SoD/EoD/통합"
+    ]
+    compact_body = [_page_row_line(row, compact=True) for row in rows]
+    content = "\n".join(compact_header + compact_body + warning_lines)
+    if len(content) <= REPORT_CONTENT_LIMIT:
+        return content
+
+    short_warnings = _warning_summary_lines(report, character_limit=100)
+    content = "\n".join(compact_header + compact_body + short_warnings)
+    return content[:REPORT_CONTENT_LIMIT]
+
+
+def build_report_txt(report: ActivityReport) -> str:
+    generated_utc = _format_timestamp(report.generated_epoch, timezone.utc)
+    generated_kst = _format_timestamp(report.generated_epoch, KST)
+    lines = [
+        "활동 현황 보고서",
+        report.period_label,
+        f"기간 epoch: [{report.start_epoch}, {report.end_epoch})",
+        f"생성 UTC: {generated_utc}",
+        f"생성 KST: {generated_kst}",
+        "",
+        *_warning_summary_lines(report),
+    ]
+    if report.warnings:
+        lines.extend(
+            ["", "전체 coverage 경고:"]
+            + [f"- [{warning.code}] {warning.text}" for warning in report.warnings]
+        )
+    lines.extend(["", "현재 대상 멤버:"])
+    if not report.rows:
+        lines.append("표시할 대상 멤버가 없습니다.")
+    for row in report.rows:
+        name = " ".join(str(row.display_name).split()) or "이름 없음"
+        lines.append(
+            " | ".join(
+                (
+                    f"name={name}",
+                    f"user_id={row.user_id}",
+                    "last_activity_utc="
+                    + _format_timestamp(row.last_activity_epoch, timezone.utc),
+                    "last_activity_kst="
+                    + _format_timestamp(row.last_activity_epoch, KST),
+                    f"reading_seconds={row.reading_seconds}",
+                    f"reading_session_count={row.reading_session_count}",
+                    f"study_seconds={row.study_seconds}",
+                    f"study_session_count={row.study_session_count}",
+                    f"sod_days={row.sod_days}",
+                    f"eod_days={row.eod_days}",
+                    f"combined_days={row.combined_days}",
+                )
+            )
+        )
+    return "\n".join(lines) + "\n"
+
+
+class ActivityReportView(discord.ui.View):
+    def __init__(
+        self,
+        owner_id: int,
+        report: ActivityReport,
+        original_response_editor,
+        *,
+        guild_id: int | None = None,
+    ) -> None:
+        super().__init__(timeout=REPORT_VIEW_TIMEOUT_SECONDS)
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+        self.report = report
+        self.page_index = 0
+        self.original_response_editor = original_response_editor
+        self.last_authorized_interaction = None
+        self._sync_page_buttons()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        permissions = getattr(interaction.user, "guild_permissions", None)
+        accepted = bool(
+            interaction.guild is not None
+            and (self.guild_id is None or interaction.guild.id == self.guild_id)
+            and interaction.user.id == self.owner_id
+            and permissions
+            and permissions.administrator
+        )
+        if not accepted:
+            message = "이 보고서를 실행한 현재 서버 관리자만 사용할 수 있습니다."
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+            return False
+        if self.guild_id is None:
+            self.guild_id = interaction.guild.id
+        self.last_authorized_interaction = interaction
+        return True
+
+    async def _move_page(self, interaction: discord.Interaction, delta: int) -> None:
+        # A message-update component interaction still targets the report's
+        # original response. A TXT interaction uses a new thinking response,
+        # so it must never replace this report editor.
+        self.original_response_editor = interaction.edit_original_response
+        last_page = max(0, self.report.page_count - 1)
+        self.page_index = min(max(0, self.page_index + delta), last_page)
+        self._sync_page_buttons()
+        await interaction.response.edit_message(
+            content=format_report_page(self.report, self.page_index),
+            view=self,
+        )
+
+    @discord.ui.button(label="이전", style=discord.ButtonStyle.secondary)
+    async def previous_page(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await self._move_page(interaction, -1)
+
+    @discord.ui.button(label="다음", style=discord.ButtonStyle.secondary)
+    async def next_page(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await self._move_page(interaction, 1)
+
+    @discord.ui.button(label="전체 TXT", style=discord.ButtonStyle.primary)
+    async def full_txt_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        data = io.BytesIO(build_report_txt(self.report).encode("utf-8"))
+        attachment = discord.File(data, filename=self.report.txt_filename)
+        await interaction.followup.send(file=attachment, ephemeral=True)
+
+    def _sync_page_buttons(self) -> None:
+        last_page = max(0, self.report.page_count - 1)
+        self.page_index = min(max(0, self.page_index), last_page)
+        self.previous_page.disabled = self.page_index == 0
+        self.next_page.disabled = self.page_index == last_page
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
+        try:
+            await self.original_response_editor(view=self)
+        except discord.DiscordException:
+            logger.warning("activity report timeout edit failed", exc_info=True)
+
+
 class ActivityCog(commands.Cog):
     settings_group = app_commands.Group(
         name="활동설정",
         description="활동 현황 수집 설정",
+        guild_only=True,
+        default_permissions=discord.Permissions(administrator=True),
+    )
+    report_group = app_commands.Group(
+        name="활동현황",
+        description="활동 현황을 조회합니다.",
         guild_only=True,
         default_permissions=discord.Permissions(administrator=True),
     )
@@ -74,6 +326,108 @@ class ActivityCog(commands.Cog):
         self._store_worker_tasks = set()
         self.recovery_task = None
         self.checkpoint_task = None
+
+    async def _send_report(self, interaction, period_factory) -> None:
+        if not await require_admin(interaction):
+            return
+        await interaction.response.defer(ephemeral=True)
+        generated_epoch = utc_now_epoch()
+        terminal_kwargs = None
+        try:
+            start_date, end_date = period_factory(generated_epoch)
+            if start_date > end_date:
+                raise ValueError("시작일은 종료일보다 늦을 수 없습니다.")
+            guild = interaction.guild
+            config, invalid_warnings = await self._invalidate_configured_resources(
+                guild,
+                generated_epoch,
+            )
+            missing = [
+                label
+                for value, label in (
+                    (config.target_role_id, "대상 역할"),
+                    (config.reading_category_id, "독서실 카테고리"),
+                    (config.study_category_id, "스터디 카테고리"),
+                    (config.sod_eod_channel_id, "SoD/EoD 채널"),
+                )
+                if value is None
+            ]
+            if missing:
+                detail = " ".join(invalid_warnings)
+                message = "활동 보고서 설정이 완전하지 않습니다: " + ", ".join(missing)
+                if detail:
+                    message += f". {detail}"
+                terminal_kwargs = {"content": message}
+            else:
+                start_epoch, end_epoch = kst_range_to_epoch(start_date, end_date)
+                members = [
+                    ReportMember(member.id, member.display_name)
+                    for member in guild.members
+                    if self._member_has_target_role(member, config)
+                ]
+                report = await self._store_call(
+                    self.store.build_report,
+                    guild_id=guild.id,
+                    members=members,
+                    start_epoch=start_epoch,
+                    end_epoch=end_epoch,
+                    as_of_epoch=generated_epoch,
+                )
+                report = dataclasses.replace(
+                    report,
+                    generated_epoch=generated_epoch,
+                )
+                view = ActivityReportView(
+                    owner_id=interaction.user.id,
+                    guild_id=guild.id,
+                    report=report,
+                    original_response_editor=interaction.edit_original_response,
+                )
+                terminal_kwargs = {
+                    "content": format_report_page(report, 0),
+                    "view": view,
+                }
+        except ValueError as error:
+            terminal_kwargs = {"content": str(error)}
+        except Exception:
+            logger.exception("activity report build failed")
+            terminal_kwargs = {
+                "content": (
+                    "활동 현황을 만들지 못했습니다. "
+                    "설정과 로그를 확인해 주세요."
+                )
+            }
+
+        try:
+            await interaction.edit_original_response(**terminal_kwargs)
+        except discord.DiscordException:
+            logger.exception("activity report terminal edit failed")
+
+    @report_group.command(name="최근", description="오늘을 포함한 최근 N일을 조회합니다.")
+    async def recent_report(
+        self,
+        interaction: discord.Interaction,
+        일수: app_commands.Range[int, 1],
+    ) -> None:
+        def period(generated_epoch: int) -> tuple[date, date]:
+            if 일수 < 1:
+                raise ValueError("일수는 1 이상이어야 합니다.")
+            today = datetime.fromtimestamp(generated_epoch, KST).date()
+            return today - timedelta(days=일수 - 1), today
+
+        await self._send_report(interaction, period)
+
+    @report_group.command(name="기간", description="KST 날짜 범위를 조회합니다.")
+    async def period_report(
+        self,
+        interaction: discord.Interaction,
+        시작일: str,
+        종료일: str,
+    ) -> None:
+        def period(_generated_epoch: int) -> tuple[date, date]:
+            return _strict_iso_date(시작일), _strict_iso_date(종료일)
+
+        await self._send_report(interaction, period)
 
     async def _store_call(self, method, *args, **kwargs):
         async with self.store_lock:

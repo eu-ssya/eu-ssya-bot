@@ -14,7 +14,14 @@ from unittest import mock
 import discord
 
 import bot as bot_module
-from activity_store import ActivityStore, ChannelChanged
+from activity_store import (
+    ActivityStore,
+    ChannelChanged,
+    CoverageWarning,
+    KST,
+    ReportRow,
+    kst_range_to_epoch,
+)
 
 from tests.activity_fixtures import (
     FakeBot,
@@ -32,10 +39,13 @@ from tests.activity_fixtures import (
     make_history_channel,
     on_disconnect_for_test,
     on_resumed_for_test,
+    make_report,
     prepare_sync_marker,
     recover_after_ready_for_test,
     record_live_message_for_test,
     run_checkpoint,
+    press,
+    report_with_members,
     session_rows,
     set_sod_channel_for_test,
     sync_state,
@@ -2725,3 +2735,415 @@ class SodEodCollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("on_message", listener_names)
         self.assertNotIn("on_message_edit", listener_names)
         self.assertNotIn("on_message_delete", listener_names)
+
+
+class ActivityReportViewTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def row(index=1, *, display_name="Member", last_activity_epoch=100):
+        return ReportRow(
+            user_id=index,
+            display_name=display_name,
+            last_activity_epoch=last_activity_epoch,
+            reading_seconds=61,
+            study_seconds=122,
+            reading_session_count=2,
+            study_session_count=3,
+            sod_days=4,
+            eod_days=5,
+            combined_days=6,
+        )
+
+    @staticmethod
+    def make_view(report, *, owner_id=1, guild_id=1):
+        from activity_cog import ActivityReportView
+
+        original = fake_deferred_interaction(owner_id, True, FakeGuild(guild_id))
+        return (
+            ActivityReportView(
+                owner_id=owner_id,
+                guild_id=guild_id,
+                report=report,
+                original_response_editor=original.edit_original_response,
+            ),
+            original,
+        )
+
+    def test_exact_page_counts_and_all_rows_are_reachable(self):
+        from activity_cog import format_report_page
+
+        for count, expected_pages in ((1, 1), (15, 1), (16, 2), (55, 4)):
+            with self.subTest(count=count):
+                report = report_with_members(count)
+                self.assertEqual(report.page_count, expected_pages)
+                pages = [format_report_page(report, page) for page in range(expected_pages)]
+                for member_id in range(count):
+                    self.assertTrue(
+                        any(f"[{member_id}]" in page for page in pages),
+                        f"member {member_id} was not reachable",
+                    )
+
+    async def test_three_argument_constructor_binds_first_authorized_guild(self):
+        from activity_cog import ActivityReportView
+
+        original = fake_interaction(1, True, FakeGuild(1))
+        view = ActivityReportView(
+            1,
+            report_with_members(16),
+            original.edit_original_response,
+        )
+        first = fake_interaction(1, True, FakeGuild(1))
+        await press(view, view.next_page, first)
+        self.assertEqual(view.guild_id, 1)
+
+        other_guild = fake_interaction(1, True, FakeGuild(2))
+        await press(view, view.previous_page, other_guild)
+        self.assertEqual(view.page_index, 1)
+        self.assertTrue(other_guild.response.sent[0][1]["ephemeral"])
+
+    async def test_page_buttons_clamp_and_round_trip_for_55_members(self):
+        report = report_with_members(55)
+        view, _original = self.make_view(report)
+        interaction = fake_interaction(1, True, FakeGuild(1))
+
+        for _ in range(9):
+            await press(view, view.next_page, interaction)
+        self.assertEqual(view.page_index, 3)
+        self.assertTrue(view.next_page.disabled)
+        self.assertFalse(view.previous_page.disabled)
+
+        for _ in range(9):
+            await press(view, view.previous_page, interaction)
+        self.assertEqual(view.page_index, 0)
+        self.assertTrue(view.previous_page.disabled)
+        self.assertFalse(view.next_page.disabled)
+
+    def test_empty_page_and_long_unicode_names_stay_below_content_limit(self):
+        from activity_cog import format_report_page
+
+        empty = format_report_page(make_report([]), 999)
+        self.assertIn("표시할 대상 멤버가 없습니다", empty)
+
+        long_name = "👩🏽‍💻한글𠮷" * 300
+        report = make_report(
+            [self.row(index, display_name=long_name) for index in range(1, 16)]
+        )
+        page = format_report_page(report, 0)
+        self.assertLessEqual(len(page), 1900)
+        page.encode("utf-8")
+        self.assertIn("[1]", page)
+        self.assertIn("[15]", page)
+
+    def test_page_and_txt_share_warning_text(self):
+        from activity_cog import build_report_txt, format_report_page
+
+        warning = CoverageWarning(
+            code="gateway_disconnect",
+            text="음성 수집 공백: 160~200",
+        )
+        report = make_report([self.row()], warnings=[warning])
+        page = format_report_page(report, 0)
+        text = build_report_txt(report)
+        self.assertIn(warning.text, page)
+        self.assertIn(warning.text, text)
+
+    async def test_owner_admin_and_same_guild_are_rechecked_before_any_mutation(self):
+        report = report_with_members(16)
+        view, original = self.make_view(report)
+        original_editor = view.original_response_editor
+        attempts = (
+            (2, True, 1),
+            (1, False, 1),
+            (1, True, 2),
+        )
+
+        for user_id, administrator, guild_id in attempts:
+            with self.subTest(user=user_id, guild=guild_id):
+                page_interaction = fake_interaction(
+                    user_id, administrator, FakeGuild(guild_id)
+                )
+                await press(view, view.next_page, page_interaction)
+                self.assertEqual(view.page_index, 0)
+                self.assertEqual(page_interaction.response.edits, [])
+                self.assertTrue(page_interaction.response.sent)
+                self.assertTrue(
+                    page_interaction.response.sent[-1][1]["ephemeral"]
+                )
+
+                txt_interaction = fake_interaction(
+                    user_id, administrator, FakeGuild(guild_id)
+                )
+                await press(view, view.full_txt_button, txt_interaction)
+                self.assertEqual(txt_interaction.followup.sent, [])
+                self.assertTrue(txt_interaction.response.sent)
+                self.assertIs(view.original_response_editor, original_editor)
+        self.assertEqual(original.original_edits, [])
+
+    async def test_accepted_click_updates_latest_editor_used_by_timeout(self):
+        report = report_with_members(16)
+        view, first = self.make_view(report)
+        latest = fake_interaction(1, True, FakeGuild(1))
+
+        await press(view, view.next_page, latest)
+        await view.on_timeout()
+
+        self.assertEqual(first.original_edits, [])
+        self.assertEqual(latest.original_edits[-1]["view"], view)
+        self.assertTrue(all(child.disabled for child in view.children))
+        self.assertLessEqual(view.timeout, 600)
+
+    async def test_txt_click_keeps_report_editor_for_timeout(self):
+        report = report_with_members(1)
+        view, report_interaction = self.make_view(report)
+        txt_interaction = fake_interaction(1, True, FakeGuild(1))
+
+        await press(view, view.full_txt_button, txt_interaction)
+        await view.on_timeout()
+
+        self.assertIs(view.last_authorized_interaction, txt_interaction)
+        self.assertEqual(report_interaction.original_edits[-1]["view"], view)
+        self.assertEqual(txt_interaction.original_edits, [])
+
+    async def test_timeout_edit_failure_only_logs(self):
+        report = report_with_members(1)
+        view, _original = self.make_view(report)
+        view.original_response_editor = mock.AsyncMock(
+            side_effect=discord.DiscordException("expired")
+        )
+        with mock.patch("activity_cog.logger.warning") as logged:
+            await view.on_timeout()
+        logged.assert_called_once()
+        view.original_response_editor.assert_awaited_once_with(view=view)
+
+    async def test_txt_defers_then_sends_one_use_bytesio_file_with_all_fields(self):
+        from activity_cog import build_report_txt
+
+        report = make_report([self.row(display_name="보고 대상")])
+        view, _original = self.make_view(report)
+        interaction = fake_interaction(1, True, FakeGuild(1))
+
+        await press(view, view.full_txt_button, interaction)
+
+        self.assertTrue(interaction.response.deferred)
+        self.assertTrue(interaction.response.defer_kwargs["ephemeral"])
+        self.assertTrue(interaction.response.defer_kwargs["thinking"])
+        self.assertEqual(len(interaction.followup.sent), 1)
+        _content, kwargs = interaction.followup.sent[0]
+        self.assertTrue(kwargs["ephemeral"])
+        attachment = kwargs["file"]
+        self.assertIsInstance(attachment, discord.File)
+        self.assertEqual(attachment.filename, report.txt_filename)
+        self.assertIsInstance(attachment.fp, __import__("io").BytesIO)
+        payload = attachment.fp.getvalue().decode("utf-8")
+        self.assertEqual(payload, build_report_txt(report))
+        for expected in (
+            "보고 대상",
+            "user_id=1",
+            "last_activity_utc=",
+            "last_activity_kst=",
+            "reading_seconds=61",
+            "reading_session_count=2",
+            "study_seconds=122",
+            "study_session_count=3",
+            "sod_days=4",
+            "eod_days=5",
+            "combined_days=6",
+            report.period_label,
+            "생성 UTC:",
+            "생성 KST:",
+        ):
+            self.assertIn(expected, payload)
+
+
+class ActivityReportCommandTests(unittest.IsolatedAsyncioTestCase):
+    def make_fixture(self):
+        cog, guild, member = configured_fixture()
+        self.addCleanup(cog._test_tmp.cleanup)
+        return cog, guild, member
+
+    @staticmethod
+    async def invoke(command, cog, interaction, *args, now=100):
+        with mock.patch("activity_cog.utc_now_epoch", return_value=now) as clock:
+            await command.callback(cog, interaction, *args)
+        return clock
+
+    def test_report_group_is_guild_only_with_admin_registration_hint_and_range(self):
+        from activity_cog import ActivityCog
+
+        self.assertTrue(ActivityCog.report_group.guild_only)
+        self.assertTrue(ActivityCog.report_group.default_permissions.administrator)
+        recent_parameter = ActivityCog.recent_report.parameters[0]
+        self.assertEqual(recent_parameter.name, "일수")
+        self.assertEqual(recent_parameter.min_value, 1)
+
+    async def test_non_admin_is_rejected_before_defer_and_store(self):
+        cog, guild, _member = self.make_fixture()
+        interaction = fake_interaction(2, False, guild)
+        with mock.patch.object(cog, "_store_call", new=mock.AsyncMock()) as store_call:
+            await cog.recent_report.callback(cog, interaction, 1)
+        store_call.assert_not_awaited()
+        self.assertFalse(interaction.response.deferred)
+        self.assertTrue(interaction.response.sent[0][1]["ephemeral"])
+
+    async def test_recent_uses_inclusive_kst_today_and_captures_generation_once(self):
+        cog, guild, _member = self.make_fixture()
+        generated = int(
+            datetime.datetime(2024, 3, 1, 0, 30, tzinfo=KST).timestamp()
+        )
+        interaction = fake_interaction(1, True, guild)
+
+        clock = await self.invoke(
+            cog.recent_report,
+            cog,
+            interaction,
+            2,
+            now=generated,
+        )
+
+        self.assertTrue(interaction.response.deferred)
+        self.assertTrue(interaction.response.defer_kwargs["ephemeral"])
+        self.assertEqual(len(interaction.original_edits), 1)
+        report = interaction.original_edits[0]["view"].report
+        self.assertEqual(report.start_date, datetime.date(2024, 2, 29))
+        self.assertEqual(report.end_date, datetime.date(2024, 3, 1))
+        self.assertEqual(report.generated_epoch, generated)
+        clock.assert_called_once_with()
+
+    async def test_admin_defer_precedes_period_validation_and_first_report_lookup(self):
+        cog, guild, _member = self.make_fixture()
+        interaction = fake_interaction(1, True, guild)
+        original = cog._invalidate_configured_resources
+
+        async def observe_lookup(*args, **kwargs):
+            self.assertTrue(interaction.response.deferred)
+            self.assertTrue(interaction.response.defer_kwargs["ephemeral"])
+            return await original(*args, **kwargs)
+
+        with mock.patch.object(
+            cog,
+            "_invalidate_configured_resources",
+            side_effect=observe_lookup,
+        ) as lookup:
+            await self.invoke(cog.recent_report, cog, interaction, 1)
+        lookup.assert_awaited_once()
+
+        invalid = fake_interaction(1, True, guild)
+        await self.invoke(cog.recent_report, cog, invalid, 0)
+        self.assertTrue(invalid.response.deferred)
+        self.assertEqual(len(invalid.original_edits), 1)
+        self.assertIn("1 이상", invalid.original_edits[0]["content"])
+
+    async def test_explicit_leap_date_is_strict_inclusive_and_start_must_not_follow_end(self):
+        cog, guild, _member = self.make_fixture()
+        valid = fake_interaction(1, True, guild)
+        await self.invoke(
+            cog.period_report,
+            cog,
+            valid,
+            "2024-02-29",
+            "2024-03-01",
+        )
+        report = valid.original_edits[0]["view"].report
+        self.assertEqual(
+            (report.start_epoch, report.end_epoch),
+            kst_range_to_epoch(datetime.date(2024, 2, 29), datetime.date(2024, 3, 1)),
+        )
+
+        for start, end in (
+            ("2024-2-29", "2024-03-01"),
+            ("2023-02-29", "2024-03-01"),
+            ("2024-03-02", "2024-03-01"),
+        ):
+            with self.subTest(start=start, end=end):
+                interaction = fake_interaction(1, True, guild)
+                await self.invoke(cog.period_report, cog, interaction, start, end)
+                self.assertEqual(len(interaction.original_edits), 1)
+                self.assertNotIn("view", interaction.original_edits[0])
+                self.assertTrue(
+                    "YYYY-MM-DD" in interaction.original_edits[0]["content"]
+                    or "늦을 수 없습니다" in interaction.original_edits[0]["content"]
+                )
+
+    async def test_current_eligible_nonbot_members_include_zero_records_only(self):
+        cog, guild, member = self.make_fixture()
+        guild.members = [
+            member.with_roles({10}),
+            FakeMember(2, guild, {10}, display_name="Zero"),
+            FakeMember(3, guild, set(), display_name="Roleless"),
+            FakeMember(4, guild, {10}, bot=True, display_name="Bot"),
+        ]
+        interaction = fake_interaction(1, True, guild)
+
+        await self.invoke(cog.recent_report, cog, interaction, 1)
+
+        rows = interaction.original_edits[0]["view"].report.rows
+        self.assertEqual({row.user_id for row in rows}, {1, 2})
+        zero = next(row for row in rows if row.user_id == 2)
+        self.assertIsNone(zero.last_activity_epoch)
+        self.assertEqual(zero.reading_seconds, 0)
+        self.assertEqual(zero.combined_days, 0)
+
+    async def test_open_session_last_activity_uses_same_single_captured_epoch(self):
+        cog, guild, member = self.make_fixture()
+        await cog._store_call(
+            cog.store.reconcile_session,
+            guild.id,
+            member.id,
+            "reading_room",
+            10,
+        )
+        generated = 200
+        interaction = fake_interaction(1, True, guild)
+
+        clock = await self.invoke(
+            cog.recent_report,
+            cog,
+            interaction,
+            1,
+            now=generated,
+        )
+
+        report = interaction.original_edits[0]["view"].report
+        self.assertEqual(report.generated_epoch, generated)
+        self.assertEqual(report.rows[0].last_activity_epoch, generated)
+        clock.assert_called_once_with()
+
+    async def test_incomplete_config_produces_one_useful_terminal_edit(self):
+        from activity_cog import ActivityCog
+
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        store = ActivityStore(str(Path(temp_dir.name) / "activity.db"))
+        store.initialize()
+        guild = FakeGuild(1)
+        cog = ActivityCog(FakeBot(), store)
+        interaction = fake_interaction(1, True, guild)
+
+        await self.invoke(cog.recent_report, cog, interaction, 1)
+
+        self.assertTrue(interaction.response.deferred)
+        self.assertEqual(len(interaction.original_edits), 1)
+        self.assertIn("설정", interaction.original_edits[0]["content"])
+        self.assertEqual(interaction.followup.sent, [])
+
+    async def test_build_error_and_terminal_edit_error_each_attempt_one_terminal_edit(self):
+        cog, guild, _member = self.make_fixture()
+        build_error = fake_interaction(1, True, guild)
+        with mock.patch.object(
+            cog.store,
+            "build_report",
+            side_effect=sqlite3.Error("database unavailable"),
+        ), mock.patch("activity_cog.logger.exception"):
+            await self.invoke(cog.recent_report, cog, build_error, 1)
+        self.assertEqual(len(build_error.original_edits), 1)
+        self.assertIn("만들지 못했습니다", build_error.original_edits[0]["content"])
+        self.assertEqual(build_error.followup.sent, [])
+
+        terminal_error = fake_interaction(1, True, guild)
+        terminal_error.edit_original_response = mock.AsyncMock(
+            side_effect=discord.DiscordException("expired")
+        )
+        with mock.patch("activity_cog.logger.exception") as logged:
+            await self.invoke(cog.recent_report, cog, terminal_error, 1)
+        terminal_error.edit_original_response.assert_awaited_once()
+        self.assertEqual(terminal_error.followup.sent, [])
+        logged.assert_called_once()
