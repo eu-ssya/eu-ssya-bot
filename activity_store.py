@@ -781,6 +781,19 @@ class ActivityStore:
             )
             return [tuple(row) for row in rows]
 
+    def list_open_session_user_ids(self, guild_id: int) -> list[int]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT user_id
+                FROM voice_sessions
+                WHERE guild_id=? AND ended_epoch IS NULL
+                ORDER BY user_id
+                """,
+                (guild_id,),
+            )
+            return [int(row[0]) for row in rows]
+
     def list_runs(
         self, guild_id: int
     ) -> list[tuple[int, int, int | None, str | None]]:

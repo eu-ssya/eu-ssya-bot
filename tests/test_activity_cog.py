@@ -338,9 +338,14 @@ class VoiceListenerTests(unittest.IsolatedAsyncioTestCase):
 
         with mock.patch.object(
             cog, "reconcile_member", wraps=cog.reconcile_member
-        ) as reconcile:
+        ) as reconcile, mock.patch.object(
+            cog,
+            "_revalidate_configured_resources_locked",
+            wraps=cog._revalidate_configured_resources_locked,
+        ) as revalidate:
             await self.call_at(90, cog.on_member_update, before, irrelevant_after)
             reconcile.assert_not_awaited()
+            revalidate.assert_not_awaited()
 
         await cog.reconcile_member(before, 100)
         await self.call_at(
@@ -355,6 +360,18 @@ class VoiceListenerTests(unittest.IsolatedAsyncioTestCase):
             [("reading_room", 100, 150, "role_removed")],
         )
 
+    async def test_member_update_target_role_addition_opens_current_voice_session(self):
+        cog, _guild, member = self.make_cog()
+        before = member.in_category(20).with_roles(set())
+        after = member.in_category(20).with_roles({10})
+
+        await self.call_at(150, cog.on_member_update, before, after)
+
+        self.assertEqual(
+            await session_rows(cog, member.id),
+            [("reading_room", 150, None, None)],
+        )
+
     async def test_guild_available_recovers_current_voice_state(self):
         cog, guild, _member = self.make_cog()
         cog.collection_gates[guild.id].clear()
@@ -364,6 +381,48 @@ class VoiceListenerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(cog.collection_gates[guild.id].is_set())
         self.assertEqual(
             await cog._store_call(cog.store.list_sessions, guild.id, 1),
+            [("reading_room", 100, None, None)],
+        )
+
+    async def test_full_reconcile_closes_absent_stored_member_and_keeps_current(self):
+        cog, guild, member = self.make_cog()
+        await cog._store_call(
+            cog.store.reconcile_session,
+            guild.id,
+            99,
+            "study",
+            50,
+        )
+
+        await cog.full_reconcile_guild(guild, 100)
+
+        self.assertEqual(
+            await cog._store_call(cog.store.list_sessions, guild.id, 99),
+            [("study", 50, 100, "reconciled")],
+        )
+        self.assertEqual(
+            await session_rows(cog, member.id),
+            [("reading_room", 100, None, None)],
+        )
+
+    async def test_guild_available_closes_absent_stored_member_and_reconciles_current(self):
+        cog, guild, member = self.make_cog()
+        await cog._store_call(
+            cog.store.reconcile_session,
+            guild.id,
+            99,
+            "reading_room",
+            50,
+        )
+
+        await self.call_at(100, cog.on_guild_available, guild)
+
+        self.assertEqual(
+            await cog._store_call(cog.store.list_sessions, guild.id, 99),
+            [("reading_room", 50, 100, "reconciled")],
+        )
+        self.assertEqual(
+            await session_rows(cog, member.id),
             [("reading_room", 100, None, None)],
         )
 
@@ -385,6 +444,18 @@ class VoiceListenerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             await cog._store_call(cog.store.list_runs, guild.id),
             [(1, 1, 150, "config_invalid")],
+        )
+        await self.call_at(
+            160,
+            cog.on_voice_state_update,
+            member,
+            object(),
+            object(),
+        )
+        self.assertIn(guild.id, cog.dirty_guilds)
+        self.assertEqual(
+            await session_rows(cog, member.id),
+            [("reading_room", 100, 150, "config_changed")],
         )
 
     async def test_reading_category_deletion_invalidates_voice(self):
@@ -472,6 +543,112 @@ class VoiceListenerTests(unittest.IsolatedAsyncioTestCase):
             await cog._store_call(cog.store.list_sessions, 1, 1), sessions_before
         )
         self.assertEqual(await cog._store_call(cog.store.list_runs, 1), runs_before)
+
+    async def test_bot_role_permission_update_invalidates_reading_and_study(self):
+        for field, channel_id, kind in (
+            ("reading_category_id", 20, "reading_room"),
+            ("study_category_id", 30, "study"),
+        ):
+            with self.subTest(field=field):
+                cog, guild, member = self.make_cog()
+                access_role = fake_role(50, guild)
+                guild.roles.append(access_role)
+                guild.me.roles = [access_role]
+                active_member = member.in_category(channel_id)
+                await cog.reconcile_member(active_member, 100)
+                guild.get_channel(channel_id).permissions_for.return_value = mock.Mock(
+                    view_channel=False
+                )
+
+                await self.call_at(
+                    150,
+                    cog.on_guild_role_update,
+                    fake_role(50, guild),
+                    access_role,
+                )
+
+                config = await cog._store_call(cog.store.get_config, guild.id)
+                self.assertIsNone(getattr(config, field))
+                self.assertFalse(cog.collection_gates[guild.id].is_set())
+                self.assertNotIn(guild.id, cog.dirty_guilds)
+                self.assertEqual(
+                    await session_rows(cog, member.id),
+                    [(kind, 100, 150, "config_changed")],
+                )
+                self.assertEqual(
+                    await cog._store_call(cog.store.list_runs, guild.id),
+                    [(1, 1, 150, "config_invalid")],
+                )
+
+    async def test_bot_role_permission_update_sod_loss_preserves_voice_gate_and_counts(self):
+        cog, guild, member = self.make_cog()
+        access_role = fake_role(50, guild)
+        guild.roles.append(access_role)
+        guild.me.roles = [access_role]
+        await cog.reconcile_member(member, 100)
+        sessions_before = await cog._store_call(cog.store.list_sessions, 1, 1)
+        runs_before = await cog._store_call(cog.store.list_runs, 1)
+        count_before = await cog._store_call(
+            cog.store.voice_session_count_for_range,
+            1,
+            1,
+            "reading_room",
+            0,
+            200,
+        )
+        guild.get_channel(40).permissions_for.return_value = mock.Mock(
+            view_channel=True,
+            read_message_history=False,
+        )
+
+        await self.call_at(
+            150,
+            cog.on_guild_role_update,
+            fake_role(50, guild),
+            access_role,
+        )
+
+        config = await cog._store_call(cog.store.get_config, guild.id)
+        self.assertIsNone(config.sod_eod_channel_id)
+        self.assertTrue(cog.collection_gates[guild.id].is_set())
+        self.assertNotIn(guild.id, cog.dirty_guilds)
+        self.assertEqual(
+            await cog._store_call(cog.store.list_sessions, 1, 1), sessions_before
+        )
+        self.assertEqual(await cog._store_call(cog.store.list_runs, 1), runs_before)
+        self.assertEqual(
+            await cog._store_call(
+                cog.store.voice_session_count_for_range,
+                1,
+                1,
+                "reading_room",
+                0,
+                200,
+            ),
+            count_before,
+        )
+
+    async def test_bot_member_role_assignment_change_revalidates_voice_access(self):
+        cog, guild, member = self.make_cog()
+        access_role = fake_role(50, guild)
+        guild.roles.append(access_role)
+        before_bot = FakeMember(999, guild, {50}, bot=True)
+        after_bot = FakeMember(999, guild, set(), bot=True)
+        guild.me = after_bot
+        await cog.reconcile_member(member, 100)
+        guild.get_channel(20).permissions_for.return_value = mock.Mock(
+            view_channel=False
+        )
+
+        await self.call_at(150, cog.on_member_update, before_bot, after_bot)
+
+        config = await cog._store_call(cog.store.get_config, guild.id)
+        self.assertIsNone(config.reading_category_id)
+        self.assertFalse(cog.collection_gates[guild.id].is_set())
+        self.assertEqual(
+            await session_rows(cog, member.id),
+            [("reading_room", 100, 150, "config_changed")],
+        )
 
     async def test_member_remove_closes_open_session_even_with_closed_gate(self):
         cog, guild, member = self.make_cog()
@@ -606,7 +783,8 @@ class VoiceListenerTests(unittest.IsolatedAsyncioTestCase):
         cases = ("role_delete", "channel_delete", "channel_update")
         for case in cases:
             with self.subTest(case=case):
-                cog, guild, _member = self.make_cog()
+                cog, guild, member = self.make_cog()
+                await cog.reconcile_member(member, 50)
                 error = sqlite3.Error("invalidation unavailable")
                 with mock.patch.object(
                     cog.store,
@@ -631,6 +809,14 @@ class VoiceListenerTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertIs(raised.exception, error)
                 self.assertFalse(cog.collection_gates[guild.id].is_set())
+                self.assertEqual(
+                    await session_rows(cog, member.id),
+                    [("reading_room", 50, 100, "config_changed")],
+                )
+                self.assertEqual(
+                    await cog._store_call(cog.store.list_runs, guild.id),
+                    [(1, 1, 100, "config_invalid")],
+                )
 
     async def test_full_reconcile_serializes_before_concurrent_config_change(self):
         cog, guild, member = self.make_cog()
@@ -893,6 +1079,14 @@ class SettingsCommandTests(unittest.IsolatedAsyncioTestCase):
         await cog.reconcile_member(guild.members[0], 100)
         sessions_before = await cog._store_call(cog.store.list_sessions, 1, 1)
         runs_before = await cog._store_call(cog.store.list_runs, 1)
+        count_before = await cog._store_call(
+            cog.store.voice_session_count_for_range,
+            1,
+            1,
+            "reading_room",
+            0,
+            200,
+        )
         new_channel = fake_text_channel(41, guild)
         guild.channels.append(new_channel)
 
@@ -908,6 +1102,17 @@ class SettingsCommandTests(unittest.IsolatedAsyncioTestCase):
             await cog._store_call(cog.store.list_sessions, 1, 1), sessions_before
         )
         self.assertEqual(await cog._store_call(cog.store.list_runs, 1), runs_before)
+        self.assertEqual(
+            await cog._store_call(
+                cog.store.voice_session_count_for_range,
+                1,
+                1,
+                "reading_room",
+                0,
+                200,
+            ),
+            count_before,
+        )
 
     async def test_voice_change_closes_and_fully_reconciles_at_the_same_epoch(self):
         cog, guild = await self.make_cog()

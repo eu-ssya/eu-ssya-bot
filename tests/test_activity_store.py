@@ -358,6 +358,14 @@ class VoiceSessionTests(unittest.TestCase):
             self.store.voice_seconds_for_range(1, 2, "study", 170, 200), 30
         )
 
+    def test_open_session_user_ids_returns_only_current_guild_open_rows(self):
+        self.store.reconcile_session(1, 2, "reading_room", 100)
+        self.store.reconcile_session(1, 3, "study", 100)
+        self.store.reconcile_session(1, 2, None, 120)
+        self.store.reconcile_session(2, 4, "reading_room", 100)
+
+        self.assertEqual(self.store.list_open_session_user_ids(1), [3])
+
     def test_voice_count_includes_only_positive_overlap_sessions(self):
         self.store.reconcile_session(1, 2, "study", 100)
         self.store.reconcile_session(1, 2, None, 120, close_reason="normal")
