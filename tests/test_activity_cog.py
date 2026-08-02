@@ -2265,6 +2265,60 @@ class SodEodCollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(state.newest_processed_message_id)
         self.assertIsNone(state.history_from_epoch)
 
+    async def test_live_cache_miss_uses_same_guild_event_member(self):
+        cog, guild, member = self.make_fixture()
+        guild.members = []
+
+        await cog.on_message(
+            self.full_message(22, member, guild.get_channel(40))
+        )
+
+        with closing(sqlite3.connect(cog.store.db_path)) as conn:
+            stored = conn.execute(
+                "SELECT user_id, event_type FROM sod_eod_events"
+            ).fetchall()
+        self.assertEqual(stored, [(member.id, "sod")])
+
+    async def test_live_rejects_thread_even_when_id_and_parent_match_config(self):
+        cog, guild, member = self.make_fixture()
+        thread = mock.Mock(spec=discord.Thread)
+        thread.id = 40
+        thread.guild = guild
+        thread.parent = guild.get_channel(40)
+
+        await cog.on_message(self.full_message(23, member, thread))
+
+        self.assertEqual(self.count_events(cog), 0)
+
+    async def test_live_rejects_reply_message_type_explicitly(self):
+        cog, guild, member = self.make_fixture()
+
+        await cog.on_message(
+            self.full_message(
+                24,
+                member,
+                guild.get_channel(40),
+                message_type=discord.MessageType.reply,
+            )
+        )
+
+        self.assertEqual(self.count_events(cog), 0)
+
+    async def test_live_cache_miss_webhook_is_still_rejected(self):
+        cog, guild, member = self.make_fixture()
+        guild.members = []
+
+        await cog.on_message(
+            self.full_message(
+                25,
+                member,
+                guild.get_channel(40),
+                webhook_id=999,
+            )
+        )
+
+        self.assertEqual(self.count_events(cog), 0)
+
     async def test_live_store_failure_is_shielded_from_other_bot_features(self):
         cog, guild, member = self.make_fixture()
         error = sqlite3.Error("database unavailable")
@@ -2294,13 +2348,23 @@ class SodEodCollectionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual((await sync_state(cog, 40)).newest_processed_message_id, 12)
 
-    async def test_backfill_streams_more_than_one_api_page_before_next_yield(self):
-        cog, guild, member = self.make_fixture()
+    async def test_backfill_streams_distinct_authors_with_bounded_lru_eviction(self):
+        from activity_cog import AUTHOR_ELIGIBILITY_CACHE_LIMIT
+
+        cog, guild, _member = self.make_fixture()
+        guild.members = []
         channel = fake_text_channel(40, guild)
-        total = 125
+        distinct_total = max(125, AUTHOR_ELIGIBILITY_CACHE_LIMIT + 1)
+        author_ids = list(range(1000, 1000 + distinct_total))
+        author_sequence = author_ids + [author_ids[-1], author_ids[0]]
+
+        async def fetch_member(user_id):
+            return FakeMember(user_id, guild, {10})
+
+        guild.fetch_member = mock.AsyncMock(side_effect=fetch_member)
 
         async def history(**kwargs):
-            for message_id in range(1, total + 1):
+            for message_id, author_id in enumerate(author_sequence, start=1):
                 if message_id > 1:
                     state = cog.store.get_sync_state(guild.id, channel.id)
                     self.assertEqual(
@@ -2308,16 +2372,21 @@ class SodEodCollectionTests(unittest.IsolatedAsyncioTestCase):
                         message_id - 1,
                         "history was consumed ahead of per-message commit",
                     )
-                yield self.full_message(message_id, member, channel)
+                author = SimpleNamespace(id=author_id, guild=guild, bot=False)
+                yield self.full_message(message_id, author, channel)
 
         channel.history.side_effect = history
         result = await cog.backfill_current_channel(guild, channel=channel)
 
-        self.assertEqual(result.processed_count, total)
-        self.assertEqual(result.event_count, total)
+        self.assertEqual(result.processed_count, len(author_sequence))
+        self.assertEqual(result.event_count, len(author_sequence))
         state = await sync_state(cog, 40)
-        self.assertEqual(state.newest_processed_message_id, total)
+        self.assertEqual(state.newest_processed_message_id, len(author_sequence))
         self.assertIsNotNone(state.completed_epoch)
+        fetched_ids = [call.args[0] for call in guild.fetch_member.await_args_list]
+        self.assertEqual(fetched_ids.count(author_ids[-1]), 1)
+        self.assertEqual(fetched_ids.count(author_ids[0]), 2)
+        self.assertEqual(len(fetched_ids), distinct_total + 1)
 
     async def test_backfill_unresolved_author_is_fetched_once_and_advances_empty(self):
         cog, guild, _member = self.make_fixture()
@@ -2400,6 +2469,25 @@ class SodEodCollectionTests(unittest.IsolatedAsyncioTestCase):
             after=discord.Object(id=50),
         )
         self.assertIsNotNone((await sync_state(cog, 40)).completed_epoch)
+
+    async def test_backfill_fetch_http_error_stops_at_last_committed_message(self):
+        cog, guild, member = self.make_fixture()
+        guild.members = [member]
+        channel = fake_text_channel(40, guild)
+        missing_author = SimpleNamespace(id=999, guild=guild, bot=False)
+        messages = [
+            self.full_message(52, member, channel),
+            self.full_message(53, missing_author, channel),
+        ]
+        channel.history.side_effect = lambda **kwargs: self._iterate(messages)
+        guild.fetch_member = mock.AsyncMock(side_effect=self.http_error())
+
+        with self.assertRaises(discord.HTTPException):
+            await cog.backfill_current_channel(guild, channel=channel)
+
+        state = await sync_state(cog, 40)
+        self.assertEqual(state.newest_processed_message_id, 52)
+        self.assertIsNone(state.completed_epoch)
 
     async def test_backfill_database_interruption_does_not_skip_failed_message(self):
         cog, guild, member = self.make_fixture()
@@ -2536,17 +2624,47 @@ class SodEodCollectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_backfill_command_error_completes_deferred_response_once(self):
         cog, guild, _member = self.make_fixture()
         interaction = fake_deferred_interaction(1, True, guild)
+        terminal_edit = mock.AsyncMock(wraps=cog._complete_ephemeral)
         with mock.patch.object(
             cog,
             "backfill_current_channel",
             new=mock.AsyncMock(side_effect=sqlite3.Error("database unavailable")),
+        ), mock.patch.object(
+            cog,
+            "_complete_ephemeral",
+            new=terminal_edit,
         ), mock.patch("activity_cog.logger.exception"):
             await cog.backfill_command.callback(cog, interaction)
 
         self.assertTrue(interaction.response.deferred)
+        terminal_edit.assert_awaited_once()
         self.assertEqual(len(interaction.original_edits), 1)
         self.assertIn("실패", interaction.original_edits[0]["content"])
         self.assertEqual(interaction.followup.sent, [])
+
+    async def test_backfill_success_terminal_edit_failure_is_never_retried(self):
+        from activity_cog import BackfillResult
+
+        cog, guild, _member = self.make_fixture()
+        interaction = fake_deferred_interaction(1, True, guild)
+        terminal_edit = mock.AsyncMock(side_effect=self.http_error())
+        with mock.patch.object(
+            cog,
+            "backfill_current_channel",
+            new=mock.AsyncMock(return_value=BackfillResult(3, 2)),
+        ), mock.patch.object(
+            cog,
+            "_complete_ephemeral",
+            new=terminal_edit,
+        ), mock.patch("activity_cog.logger.exception") as logged:
+            with self.assertRaises(discord.HTTPException):
+                await cog.backfill_command.callback(cog, interaction)
+
+        terminal_edit.assert_awaited_once()
+        content = terminal_edit.await_args.args[1]
+        self.assertIn("감지 2개", content)
+        self.assertNotIn("기록 2개", content)
+        logged.assert_called_once()
 
     def test_only_message_create_listener_is_registered_for_text_activity(self):
         from activity_cog import ActivityCog

@@ -4,7 +4,7 @@ import logging
 import os
 import re
 import sqlite3
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 SOD_EOD_PATTERN = re.compile(r"(?<![a-z0-9])(sod|eod)(?![a-z0-9])")
+AUTHOR_ELIGIBILITY_CACHE_LIMIT = 64
 
 
 def detect_sod_eod(content: str) -> set[str]:
@@ -274,8 +275,8 @@ class ActivityCog(commands.Cog):
             in {getattr(role, "id", None) for role in member.roles}
         )
 
-    @classmethod
-    def _message_is_eligible(cls, message, guild, config, member) -> bool:
+    @staticmethod
+    def _message_envelope_is_eligible(message, guild, config) -> bool:
         message_guild = getattr(message, "guild", None)
         channel = getattr(message, "channel", None)
         return bool(
@@ -285,8 +286,27 @@ class ActivityCog(commands.Cog):
             and getattr(channel, "id", None) == config.sod_eod_channel_id
             and getattr(message, "type", None) is discord.MessageType.default
             and getattr(message, "webhook_id", None) is None
+        )
+
+    @classmethod
+    def _message_is_eligible(cls, message, guild, config, member) -> bool:
+        return bool(
+            cls._message_envelope_is_eligible(message, guild, config)
             and cls._member_has_target_role(member, config)
         )
+
+    @staticmethod
+    def _event_member_or_cached(message, guild):
+        author = getattr(message, "author", None)
+        author_guild = getattr(author, "guild", None)
+        if (
+            getattr(author_guild, "id", None) == guild.id
+            and hasattr(author, "roles")
+            and hasattr(author, "bot")
+        ):
+            return author
+        author_id = getattr(author, "id", None)
+        return None if author_id is None else guild.get_member(author_id)
 
     @staticmethod
     def desired_kind_for_member(member, config) -> str | None:
@@ -473,9 +493,7 @@ class ActivityCog(commands.Cog):
             return
         try:
             config = await self._store_call(self.store.get_config, guild.id)
-            author = getattr(message, "author", None)
-            author_id = getattr(author, "id", None)
-            member = None if author_id is None else guild.get_member(author_id)
+            member = self._event_member_or_cached(message, guild)
             if not self._message_is_eligible(message, guild, config, member):
                 return
             event_types = detect_sod_eod(message.content)
@@ -539,26 +557,32 @@ class ActivityCog(commands.Cog):
 
             processed_count = 0
             event_count = 0
-            fetched_members = {}
+            author_eligibility = OrderedDict()
             async for message in channel.history(
                 limit=None,
                 oldest_first=True,
                 after=after,
             ):
                 author_id = message.author.id
-                member = guild.get_member(author_id)
-                if member is None:
-                    if author_id not in fetched_members:
+                try:
+                    eligible_author = author_eligibility.pop(author_id)
+                except KeyError:
+                    member = guild.get_member(author_id)
+                    if member is None:
                         try:
-                            fetched_members[author_id] = await guild.fetch_member(
-                                author_id
-                            )
+                            member = await guild.fetch_member(author_id)
                         except (discord.NotFound, discord.Forbidden):
-                            fetched_members[author_id] = None
-                    member = fetched_members[author_id]
+                            member = None
+                    eligible_author = self._member_has_target_role(member, config)
+                author_eligibility[author_id] = eligible_author
+                if len(author_eligibility) > AUTHOR_ELIGIBILITY_CACHE_LIMIT:
+                    author_eligibility.popitem(last=False)
 
                 event_types = set()
-                if self._message_is_eligible(message, guild, config, member):
+                if (
+                    eligible_author
+                    and self._message_envelope_is_eligible(message, guild, config)
+                ):
                     event_types = detect_sod_eod(message.content)
                 message_created_epoch = int(message.created_at.timestamp())
                 await self._store_call(
@@ -985,17 +1009,24 @@ class ActivityCog(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         try:
             result = await self.backfill_current_channel(interaction.guild)
-            await self._complete_ephemeral(
-                interaction,
+            content = (
                 "과거 동기화 완료: "
-                f"처리 {result.processed_count}개, 기록 {result.event_count}개",
+                f"처리 {result.processed_count}개, 감지 {result.event_count}개"
             )
         except (sqlite3.Error, discord.DiscordException, ChannelChanged, ValueError):
             logger.exception("activity SoD/EoD backfill failed")
+            content = (
+                "과거 동기화에 실패했습니다. "
+                "설정, 로그와 채널 권한을 확인해 주세요."
+            )
+        try:
             await self._complete_ephemeral(
                 interaction,
-                "과거 동기화에 실패했습니다. 설정, 로그와 채널 권한을 확인해 주세요.",
+                content,
             )
+        except discord.DiscordException:
+            logger.exception("activity SoD/EoD backfill response edit failed")
+            raise
 
     async def _invalidate_configured_resources(
         self, guild, effective_at_epoch: int
