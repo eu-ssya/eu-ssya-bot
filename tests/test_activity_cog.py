@@ -2833,6 +2833,55 @@ class ActivityReportViewTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[1]", page)
         self.assertIn("[15]", page)
 
+    def test_worst_case_page_keeps_every_row_and_field_complete(self):
+        from activity_cog import format_report_page
+
+        huge = 10**250
+        rows = [
+            ReportRow(
+                user_id=index,
+                display_name=f"N{index:02d}-" + ("👩🏽‍💻한글𠮷" * 200),
+                last_activity_epoch=huge,
+                reading_seconds=huge,
+                study_seconds=huge - index,
+                reading_session_count=huge - 100,
+                study_session_count=huge - 200,
+                sod_days=huge - 300,
+                eod_days=huge - 400,
+                combined_days=huge - 500,
+            )
+            for index in range(1, 16)
+        ]
+        warnings = [
+            CoverageWarning(
+                code=f"warning_{index:02d}_" + ("x" * 100),
+                text=f"경고 {index:02d} " + ("매우 긴 경고 내용 " * 100),
+            )
+            for index in range(30)
+        ]
+
+        page = format_report_page(make_report(rows, warnings=warnings), 0)
+        row_lines = [line for line in page.splitlines() if line.startswith("[")]
+
+        self.assertLessEqual(len(page), 1900)
+        page.encode("utf-8")
+        self.assertEqual(len(row_lines), 15)
+        for index, line in enumerate(row_lines, 1):
+            self.assertIn(f"[{index}]", line)
+            self.assertIn(f"N{index:02d}", line)
+            for label in (
+                "최근=",
+                "독서초=",
+                "독서회=",
+                "스터디초=",
+                "스터디회=",
+                "SoD=",
+                "EoD=",
+                "통합=",
+            ):
+                self.assertIn(label, line)
+        self.assertIn("전체 TXT", page)
+
     def test_page_and_txt_share_warning_text(self):
         from activity_cog import build_report_txt, format_report_page
 
@@ -2878,6 +2927,20 @@ class ActivityReportViewTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIs(view.original_response_editor, original_editor)
         self.assertEqual(original.original_edits, [])
 
+    async def test_denied_click_does_not_replace_latest_authorized_editor(self):
+        view, _original = self.make_view(report_with_members(16))
+        authorized = fake_interaction(1, True, FakeGuild(1))
+        await press(view, view.next_page, authorized)
+        authorized_editor = view.original_response_editor
+
+        denied = fake_interaction(2, True, FakeGuild(1))
+        await press(view, view.previous_page, denied)
+
+        self.assertIs(view.last_authorized_interaction, authorized)
+        self.assertIs(view.original_response_editor, authorized_editor)
+        self.assertEqual(view.page_index, 1)
+        self.assertTrue(denied.response.sent[0][1]["ephemeral"])
+
     async def test_accepted_click_updates_latest_editor_used_by_timeout(self):
         report = report_with_members(16)
         view, first = self.make_view(report)
@@ -2891,17 +2954,26 @@ class ActivityReportViewTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(child.disabled for child in view.children))
         self.assertLessEqual(view.timeout, 600)
 
-    async def test_txt_click_keeps_report_editor_for_timeout(self):
+    async def test_txt_click_near_ten_minutes_refreshes_report_editor_for_timeout(self):
         report = report_with_members(1)
-        view, report_interaction = self.make_view(report)
+        view, initial_interaction = self.make_view(report)
+        initial_interaction.edit_original_response = mock.AsyncMock(
+            side_effect=discord.DiscordException("initial token expired")
+        )
+        view.original_response_editor = initial_interaction.edit_original_response
         txt_interaction = fake_interaction(1, True, FakeGuild(1))
 
         await press(view, view.full_txt_button, txt_interaction)
         await view.on_timeout()
 
         self.assertIs(view.last_authorized_interaction, txt_interaction)
-        self.assertEqual(report_interaction.original_edits[-1]["view"], view)
-        self.assertEqual(txt_interaction.original_edits, [])
+        self.assertIs(
+            view.original_response_editor,
+            txt_interaction.edit_original_response,
+        )
+        initial_interaction.edit_original_response.assert_not_awaited()
+        self.assertEqual(txt_interaction.original_edits[-1]["view"], view)
+        self.assertTrue(all(child.disabled for child in view.children))
 
     async def test_timeout_edit_failure_only_logs(self):
         report = report_with_members(1)
@@ -2924,8 +2996,7 @@ class ActivityReportViewTests(unittest.IsolatedAsyncioTestCase):
         await press(view, view.full_txt_button, interaction)
 
         self.assertTrue(interaction.response.deferred)
-        self.assertTrue(interaction.response.defer_kwargs["ephemeral"])
-        self.assertTrue(interaction.response.defer_kwargs["thinking"])
+        self.assertFalse(interaction.response.defer_kwargs["thinking"])
         self.assertEqual(len(interaction.followup.sent), 1)
         _content, kwargs = interaction.followup.sent[0]
         self.assertTrue(kwargs["ephemeral"])
