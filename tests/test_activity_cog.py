@@ -7,7 +7,35 @@ from unittest import mock
 
 import bot as bot_module
 
-from tests.activity_fixtures import FakeBot
+from tests.activity_fixtures import FakeBot, FakeMember, fake_interaction
+
+
+class FixtureContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_followup_send_records_content_files_and_ephemeral_kwargs(self):
+        interaction = fake_interaction(user_id=1, administrator=True)
+        files = [object()]
+
+        self.assertTrue(hasattr(interaction.followup, "send"))
+        await interaction.followup.send(
+            "report ready",
+            files=files,
+            ephemeral=True,
+        )
+
+        self.assertEqual(
+            interaction.followup.sent,
+            [("report ready", {"files": files, "ephemeral": True})],
+        )
+
+    def test_fake_member_has_default_display_name_and_preserves_custom_name(self):
+        self.assertIn("display_name", FakeMember.__dataclass_fields__)
+        default_member = FakeMember(1, object(), {10})
+        named_member = FakeMember(2, object(), {10}, display_name="Alice")
+
+        self.assertTrue(default_member.display_name)
+        self.assertEqual(named_member.display_name, "Alice")
+        self.assertEqual(named_member.in_category(20).display_name, "Alice")
+        self.assertEqual(named_member.with_roles({20}).display_name, "Alice")
 
 
 class LoadIsolationTests(unittest.IsolatedAsyncioTestCase):
@@ -140,29 +168,47 @@ class StoreBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(raised.exception, error)
 
     async def test_store_call_serializes_whole_synchronous_calls(self):
-        entered = []
-        first_entered = threading.Event()
-        release_first = threading.Event()
+        boundary_entries = []
+        method_calls = []
+        first_entered = asyncio.Event()
+        release_first = asyncio.Event()
+        second_started = asyncio.Event()
 
         def recording_method(name):
-            entered.append(name)
-            if name == "first":
-                first_entered.set()
-                release_first.wait(timeout=1)
+            method_calls.append(name)
             return name
 
-        first = asyncio.create_task(self.cog._store_call(recording_method, "first"))
-        reached_worker = await asyncio.to_thread(first_entered.wait, 1)
-        self.assertTrue(reached_worker)
-        second = asyncio.create_task(self.cog._store_call(recording_method, "second"))
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
+        async def controlled_to_thread(method, *args, **kwargs):
+            name = args[0]
+            boundary_entries.append(name)
+            if name == "first":
+                first_entered.set()
+                await release_first.wait()
+            return method(*args, **kwargs)
 
-        self.assertEqual(entered, ["first"])
+        async def invoke_second():
+            second_started.set()
+            return await self.cog._store_call(recording_method, "second")
 
-        release_first.set()
-        self.assertEqual(await asyncio.gather(first, second), ["first", "second"])
-        self.assertEqual(entered, ["first", "second"])
+        with mock.patch("activity_cog.asyncio.to_thread", controlled_to_thread):
+            first = asyncio.create_task(
+                self.cog._store_call(recording_method, "first")
+            )
+            await first_entered.wait()
+            second = asyncio.create_task(invoke_second())
+            await second_started.wait()
+
+            self.assertEqual(boundary_entries, ["first"])
+            self.assertEqual(method_calls, [])
+
+            release_first.set()
+            self.assertEqual(
+                await asyncio.gather(first, second),
+                ["first", "second"],
+            )
+
+        self.assertEqual(boundary_entries, ["first", "second"])
+        self.assertEqual(method_calls, ["first", "second"])
 
     def test_cog_has_shared_store_lock_and_per_guild_locks_and_gates(self):
         self.assertIs(self.cog.guild_locks[1], self.cog.guild_locks[1])

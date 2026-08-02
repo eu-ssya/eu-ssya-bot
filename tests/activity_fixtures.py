@@ -45,6 +45,10 @@ class FakeResponse:
         self.done = True
         self.sent.append((content, kwargs))
 
+    async def send(self, content=None, **kwargs):
+        self.done = True
+        self.sent.append((content, kwargs))
+
     async def edit_message(self, **kwargs):
         self.done = True
         self.edits.append(kwargs)
@@ -117,6 +121,7 @@ class FakeMember:
     role_ids: set[int]
     category_id: int | None = None
     bot: bool = False
+    display_name: str = "Fake Member"
 
     @property
     def roles(self):
@@ -127,10 +132,24 @@ class FakeMember:
         return SimpleNamespace(channel=SimpleNamespace(category_id=self.category_id))
 
     def in_category(self, category_id):
-        return FakeMember(self.id, self.guild, set(self.role_ids), category_id, self.bot)
+        return FakeMember(
+            self.id,
+            self.guild,
+            set(self.role_ids),
+            category_id,
+            self.bot,
+            self.display_name,
+        )
 
     def with_roles(self, role_ids):
-        return FakeMember(self.id, self.guild, set(role_ids), self.category_id, self.bot)
+        return FakeMember(
+            self.id,
+            self.guild,
+            set(role_ids),
+            self.category_id,
+            self.bot,
+            self.display_name,
+        )
 
 
 class FakeGuild:
