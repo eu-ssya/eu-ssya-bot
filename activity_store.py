@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 KST = timezone(timedelta(hours=9), "KST")
+_UNSET = object()
 
 
 def kst_day_for_epoch(epoch: int) -> str:
@@ -86,3 +87,207 @@ class ActivityStore:
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
             )
             return [row[0] for row in rows]
+
+    def get_config(self, guild_id: int) -> ActivityConfig:
+        with closing(self._connect()) as conn:
+            return self._get_config_in_tx(conn, guild_id)
+
+    def apply_config_change(
+        self,
+        guild_id: int,
+        *,
+        effective_at_epoch: int,
+        target_role_id: int | None | object = _UNSET,
+        reading_category_id: int | None | object = _UNSET,
+        study_category_id: int | None | object = _UNSET,
+        sod_eod_channel_id: int | None | object = _UNSET,
+    ) -> ActivityConfig:
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                old = self._get_config_in_tx(conn, guild_id)
+                new = self._replace_unset(
+                    old,
+                    target_role_id,
+                    reading_category_id,
+                    study_category_id,
+                    sod_eod_channel_id,
+                )
+                if (
+                    new.reading_category_id is not None
+                    and new.reading_category_id == new.study_category_id
+                ):
+                    raise ValueError("독서실과 스터디 카테고리는 서로 달라야 합니다.")
+                if old.voice_collection_started_epoch is None and new.voice_is_complete:
+                    new = dataclasses.replace(
+                        new, voice_collection_started_epoch=effective_at_epoch
+                    )
+                if self._voice_core_changed(old, new):
+                    self._close_open_rows_in_tx(
+                        conn, guild_id, effective_at_epoch, "config_changed"
+                    )
+                if old.sod_eod_channel_id != new.sod_eod_channel_id:
+                    self._transition_sod_period_in_tx(
+                        conn,
+                        guild_id,
+                        old.sod_eod_channel_id,
+                        new.sod_eod_channel_id,
+                        effective_at_epoch,
+                    )
+                self._upsert_config_in_tx(conn, new, effective_at_epoch)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return new
+
+    def list_channel_periods(self, guild_id: int) -> list[tuple[int, int, int | None]]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT channel_id, started_epoch, ended_epoch
+                FROM sod_eod_channel_periods
+                WHERE guild_id=?
+                ORDER BY started_epoch, id
+                """,
+                (guild_id,),
+            )
+            return [tuple(row) for row in rows]
+
+    @staticmethod
+    def _replace_unset(
+        old: ActivityConfig,
+        target_role_id: int | None | object,
+        reading_category_id: int | None | object,
+        study_category_id: int | None | object,
+        sod_eod_channel_id: int | None | object,
+    ) -> ActivityConfig:
+        return dataclasses.replace(
+            old,
+            target_role_id=(
+                old.target_role_id if target_role_id is _UNSET else target_role_id
+            ),
+            reading_category_id=(
+                old.reading_category_id
+                if reading_category_id is _UNSET
+                else reading_category_id
+            ),
+            study_category_id=(
+                old.study_category_id if study_category_id is _UNSET else study_category_id
+            ),
+            sod_eod_channel_id=(
+                old.sod_eod_channel_id if sod_eod_channel_id is _UNSET else sod_eod_channel_id
+            ),
+        )
+
+    @staticmethod
+    def _voice_core_changed(old: ActivityConfig, new: ActivityConfig) -> bool:
+        return (
+            old.target_role_id,
+            old.reading_category_id,
+            old.study_category_id,
+        ) != (
+            new.target_role_id,
+            new.reading_category_id,
+            new.study_category_id,
+        )
+
+    @staticmethod
+    def _get_config_in_tx(conn: sqlite3.Connection, guild_id: int) -> ActivityConfig:
+        row = conn.execute(
+            """
+            SELECT guild_id, target_role_id, reading_category_id, study_category_id,
+                   sod_eod_channel_id, voice_collection_started_epoch
+            FROM activity_config
+            WHERE guild_id=?
+            """,
+            (guild_id,),
+        ).fetchone()
+        if row is None:
+            return ActivityConfig(guild_id, None, None, None, None, None)
+        return ActivityConfig(*row)
+
+    @staticmethod
+    def _close_open_rows_in_tx(
+        conn: sqlite3.Connection, guild_id: int, effective_at_epoch: int, reason: str
+    ) -> None:
+        conn.execute(
+            """
+            UPDATE voice_sessions
+            SET ended_epoch=?, closed_reason=?
+            WHERE guild_id=? AND ended_epoch IS NULL
+            """,
+            (effective_at_epoch, reason, guild_id),
+        )
+        conn.execute(
+            """
+            UPDATE voice_collection_runs
+            SET ended_epoch=?, ended_reason=?
+            WHERE guild_id=? AND ended_epoch IS NULL
+            """,
+            (effective_at_epoch, reason, guild_id),
+        )
+
+    @staticmethod
+    def _transition_sod_period_in_tx(
+        conn: sqlite3.Connection,
+        guild_id: int,
+        old_channel_id: int | None,
+        new_channel_id: int | None,
+        effective_at_epoch: int,
+    ) -> None:
+        if old_channel_id is not None:
+            conn.execute(
+                """
+                UPDATE sod_eod_channel_periods
+                SET ended_epoch=?, ended_reason='channel_changed'
+                WHERE guild_id=? AND ended_epoch IS NULL
+                """,
+                (effective_at_epoch, guild_id),
+            )
+        if new_channel_id is not None:
+            conn.execute(
+                """
+                INSERT INTO sod_eod_channel_periods(guild_id, channel_id, started_epoch)
+                VALUES (?, ?, ?)
+                """,
+                (guild_id, new_channel_id, effective_at_epoch),
+            )
+            conn.execute(
+                """
+                INSERT INTO activity_sync_state(guild_id, channel_id, updated_epoch)
+                VALUES (?, ?, ?)
+                ON CONFLICT(guild_id, channel_id) DO NOTHING
+                """,
+                (guild_id, new_channel_id, effective_at_epoch),
+            )
+
+    @staticmethod
+    def _upsert_config_in_tx(
+        conn: sqlite3.Connection, config: ActivityConfig, effective_at_epoch: int
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO activity_config(
+                guild_id, target_role_id, reading_category_id, study_category_id,
+                sod_eod_channel_id, voice_collection_started_epoch, created_epoch, updated_epoch
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET
+                target_role_id=excluded.target_role_id,
+                reading_category_id=excluded.reading_category_id,
+                study_category_id=excluded.study_category_id,
+                sod_eod_channel_id=excluded.sod_eod_channel_id,
+                voice_collection_started_epoch=excluded.voice_collection_started_epoch,
+                updated_epoch=excluded.updated_epoch
+            """,
+            (
+                config.guild_id,
+                config.target_role_id,
+                config.reading_category_id,
+                config.study_category_id,
+                config.sod_eod_channel_id,
+                config.voice_collection_started_epoch,
+                effective_at_epoch,
+                effective_at_epoch,
+            ),
+        )
