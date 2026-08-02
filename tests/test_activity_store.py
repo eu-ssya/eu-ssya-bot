@@ -856,3 +856,275 @@ class SodEodStoreTests(unittest.TestCase):
         self.assertIsNone(
             self.store.get_sync_state(1, 2).newest_processed_message_id
         )
+
+
+class ReportStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = ActivityStore(str(Path(self.tmp.name) / "activity.db"))
+        self.store.initialize()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_zero_member_sort_and_positive_overlap_count(self):
+        members = [
+            activity_store.ReportMember(1, "Zulu"),
+            activity_store.ReportMember(2, "Alpha"),
+            activity_store.ReportMember(3, "Bravo"),
+        ]
+        self.store.reconcile_session(1, 3, "study", 100)
+        self.store.reconcile_session(
+            1, 3, None, 160, close_reason="normal"
+        )
+
+        report = self.store.build_report(
+            guild_id=1,
+            members=members,
+            start_epoch=0,
+            end_epoch=200,
+            as_of_epoch=200,
+        )
+
+        self.assertEqual([row.user_id for row in report.rows], [2, 1, 3])
+        self.assertEqual(
+            (report.rows[-1].study_seconds, report.rows[-1].study_session_count),
+            (60, 1),
+        )
+        self.assertEqual(report.rows[0].last_activity_epoch, None)
+
+    def test_exact_boundaries_count_only_positive_overlap_sessions(self):
+        self.store.reconcile_session(1, 3, "study", 50)
+        self.store.reconcile_session(1, 3, None, 120, close_reason="normal")
+        self.store.reconcile_session(1, 3, "reading_room", 120)
+        self.store.reconcile_session(1, 3, None, 150, close_reason="normal")
+        self.store.reconcile_session(1, 3, "study", 150)
+        self.store.reconcile_session(1, 3, None, 200, close_reason="normal")
+        self.store.reconcile_session(1, 3, "reading_room", 200)
+        self.store.reconcile_session(1, 3, None, 230, close_reason="normal")
+
+        report = self.store.build_report(
+            guild_id=1,
+            members=[activity_store.ReportMember(3, "Bravo")],
+            start_epoch=120,
+            end_epoch=200,
+            as_of_epoch=300,
+        )
+
+        self.assertEqual(len(report.rows), 1)
+        row = report.rows[0]
+        self.assertEqual(
+            (
+                row.reading_seconds,
+                row.reading_session_count,
+                row.study_seconds,
+                row.study_session_count,
+            ),
+            (30, 1, 50, 1),
+        )
+
+    def test_last_activity_uses_latest_preserved_record_outside_query_range(self):
+        self.store.reconcile_session(1, 3, "study", 500)
+        self.store.reconcile_session(
+            1, 3, None, 520, close_reason="normal"
+        )
+
+        report = self.store.build_report(
+            guild_id=1,
+            members=[activity_store.ReportMember(3, "Bravo")],
+            start_epoch=0,
+            end_epoch=200,
+            as_of_epoch=600,
+        )
+
+        self.assertEqual(len(report.rows), 1)
+        self.assertEqual(report.rows[0].last_activity_epoch, 520)
+        self.assertEqual(report.rows[0].study_seconds, 0)
+        self.assertEqual(report.rows[0].study_session_count, 0)
+
+    def test_open_session_last_activity_uses_report_as_of_and_name_order(self):
+        members = [
+            activity_store.ReportMember(2, "No Record"),
+            activity_store.ReportMember(3, "Zulu"),
+            activity_store.ReportMember(4, "alpha"),
+        ]
+        self.store.reconcile_session(1, 3, "study", 100)
+        self.store.reconcile_session(1, 4, "reading_room", 200)
+        self.store.checkpoint_open_rows(1, 650)
+
+        report = self.store.build_report(
+            guild_id=1,
+            members=members,
+            start_epoch=0,
+            end_epoch=300,
+            as_of_epoch=700,
+        )
+
+        self.assertEqual([row.user_id for row in report.rows], [2, 4, 3])
+        self.assertEqual(
+            [row.last_activity_epoch for row in report.rows], [None, 700, 700]
+        )
+
+    def test_daily_counts_are_distinct_and_combined_days_are_a_union(self):
+        day_1_start, _ = kst_range_to_epoch(date(2026, 8, 1), date(2026, 8, 1))
+        day_2_start, _ = kst_range_to_epoch(date(2026, 8, 2), date(2026, 8, 2))
+        day_3_start, _ = kst_range_to_epoch(date(2026, 8, 3), date(2026, 8, 3))
+        start_epoch, end_epoch = kst_range_to_epoch(
+            date(2026, 8, 1), date(2026, 8, 2)
+        )
+        self.store.apply_config_change(
+            1, sod_eod_channel_id=10, effective_at_epoch=day_1_start
+        )
+        for message_id, created_epoch, event_types in (
+            (1, day_1_start + 10, {"sod", "eod"}),
+            (2, day_1_start + 20, {"sod"}),
+            (3, day_2_start + 10, {"sod"}),
+            (4, day_3_start + 10, {"eod"}),
+        ):
+            self.store.record_live_message(
+                guild_id=1,
+                channel_id=10,
+                message_id=message_id,
+                user_id=3,
+                message_created_epoch=created_epoch,
+                event_types=event_types,
+                updated_epoch=created_epoch,
+                expected_current_channel_id=10,
+            )
+
+        report = self.store.build_report(
+            guild_id=1,
+            members=[activity_store.ReportMember(3, "Bravo")],
+            start_epoch=start_epoch,
+            end_epoch=end_epoch,
+            as_of_epoch=day_3_start + 100,
+        )
+
+        self.assertEqual(len(report.rows), 1)
+        row = report.rows[0]
+        self.assertEqual((row.sod_days, row.eod_days, row.combined_days), (2, 1, 2))
+        self.assertEqual(row.last_activity_epoch, day_3_start + 10)
+
+    def test_all_55_current_members_are_returned_in_deterministic_order(self):
+        members = [
+            activity_store.ReportMember(user_id, f"Member {user_id:02d}")
+            for user_id in range(55, 0, -1)
+        ]
+
+        report = self.store.build_report(
+            guild_id=1,
+            members=members,
+            start_epoch=0,
+            end_epoch=200,
+            as_of_epoch=200,
+        )
+
+        self.assertEqual(len(report.rows), 55)
+        self.assertEqual([row.user_id for row in report.rows], list(range(1, 56)))
+        self.assertEqual(report.page_count, 4)
+
+    def test_structured_warnings_cover_merged_voice_and_channel_source_facts(self):
+        self.store.open_collection_run(1, 120)
+        self.store.close_open_rows(1, 160, "graceful_shutdown")
+        self.store.open_collection_run(1, 160)
+        self.store.close_open_rows(1, 180, "graceful_shutdown")
+        self.store.open_collection_run(1, 220)
+        self.store.close_open_rows(1, 260, "graceful_shutdown")
+
+        self.store.apply_config_change(
+            1, sod_eod_channel_id=10, effective_at_epoch=130
+        )
+        self.store.record_backfill_message_and_advance_cursor(
+            guild_id=1,
+            channel_id=10,
+            message_id=1,
+            user_id=3,
+            message_created_epoch=150,
+            event_types=set(),
+            newest_processed_message_created_epoch=150,
+            updated_epoch=150,
+            expected_current_channel_id=10,
+        )
+        self.store.mark_backfill_completed(1, 10, 180)
+        self.store.apply_config_change(
+            1, sod_eod_channel_id=20, effective_at_epoch=210
+        )
+        self.store.invalidate_sod_eod_channel(1, effective_at_epoch=270)
+
+        report = self.store.build_report(
+            guild_id=1,
+            members=[],
+            start_epoch=100,
+            end_epoch=300,
+            as_of_epoch=300,
+        )
+
+        warning_pairs = [(warning.code, warning.text) for warning in report.warnings]
+        self.assertEqual(
+            [text for code, text in warning_pairs if code == "voice_gap"],
+            [
+                "음성 수집 누락 구간: 100~120 UTC epoch. 이 구간의 값은 부분 데이터입니다.",
+                "음성 수집 누락 구간: 180~220 UTC epoch. 이 구간의 값은 부분 데이터입니다.",
+                "음성 수집 누락 구간: 260~300 UTC epoch. 이 구간의 값은 부분 데이터입니다.",
+            ],
+        )
+        self.assertEqual(
+            [text for code, text in warning_pairs if code == "sod_channel_gap"],
+            [
+                "SoD/EoD 채널 미설정 구간: 100~130 UTC epoch. 이 구간의 값은 부분 데이터입니다.",
+                "SoD/EoD 채널 미설정 구간: 270~300 UTC epoch. 이 구간의 값은 부분 데이터입니다.",
+            ],
+        )
+        self.assertIn(
+            (
+                "sod_history_partial",
+                "SoD/EoD 채널 10의 접근 가능한 이력은 150 UTC epoch부터입니다; 활성 구간 130~150 UTC epoch의 값은 부분 데이터입니다.",
+            ),
+            warning_pairs,
+        )
+        self.assertIn(
+            (
+                "sod_history_unavailable",
+                "SoD/EoD 채널 20의 접근 가능한 과거 이력 시작점을 확인할 수 없습니다; 활성 구간 210~270 UTC epoch의 값은 부분 데이터입니다.",
+            ),
+            warning_pairs,
+        )
+        self.assertEqual(
+            [text for code, text in warning_pairs if code == "sod_backfill_incomplete"],
+            [
+                "SoD/EoD 채널 20의 과거 동기화가 완료되지 않았습니다; 활성 구간 210~270 UTC epoch의 값은 부분 데이터입니다."
+            ],
+        )
+        self.assertFalse(any("추정" in text for _, text in warning_pairs))
+
+    def test_no_channel_history_warns_unavailable_without_estimating(self):
+        report = self.store.build_report(
+            guild_id=1,
+            members=[],
+            start_epoch=100,
+            end_epoch=300,
+            as_of_epoch=300,
+        )
+
+        warning_pairs = {(warning.code, warning.text) for warning in report.warnings}
+        self.assertIn(
+            (
+                "sod_history_unavailable",
+                "조회 구간 100~300 UTC epoch에 SoD/EoD 채널 이력 시작점을 확인할 수 없습니다.",
+            ),
+            warning_pairs,
+        )
+        self.assertFalse(any("추정" in warning.text for warning in report.warnings))
+
+    def test_report_epoch_arguments_require_integers(self):
+        for field in ("start_epoch", "end_epoch", "as_of_epoch"):
+            arguments = {
+                "guild_id": 1,
+                "members": [],
+                "start_epoch": 0,
+                "end_epoch": 200,
+                "as_of_epoch": 200,
+            }
+            arguments[field] = 100.5
+            with self.subTest(field=field), self.assertRaises(TypeError):
+                self.store.build_report(**arguments)

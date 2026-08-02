@@ -26,6 +26,19 @@ def kst_range_to_epoch(start: date, end: date) -> tuple[int, int]:
     return start_epoch, end_epoch
 
 
+def session_overlap_seconds(
+    started_epoch: int,
+    ended_epoch: int | None,
+    range_start: int,
+    range_end: int,
+) -> int:
+    effective_end = range_end if ended_epoch is None else ended_epoch
+    return max(
+        0,
+        min(effective_end, range_end) - max(started_epoch, range_start),
+    )
+
+
 @dataclass(frozen=True)
 class ActivityConfig:
     guild_id: int
@@ -44,6 +57,40 @@ class ActivityConfig:
 class ReportMember:
     user_id: int
     display_name: str
+
+
+@dataclass(frozen=True)
+class ReportRow:
+    user_id: int
+    display_name: str
+    last_activity_epoch: int | None
+    reading_seconds: int
+    study_seconds: int
+    reading_session_count: int
+    study_session_count: int
+    sod_days: int
+    eod_days: int
+    combined_days: int
+
+
+@dataclass(frozen=True)
+class CoverageWarning:
+    code: str
+    text: str
+
+
+@dataclass(frozen=True)
+class ActivityReport:
+    rows: list[ReportRow]
+    warnings: list[CoverageWarning]
+    start_date: date
+    end_date: date
+    start_epoch: int
+    end_epoch: int
+    generated_epoch: int
+    period_label: str
+    txt_filename: str
+    page_count: int
 
 
 @dataclass(frozen=True)
@@ -423,6 +470,273 @@ class ActivityStore:
         if cursor < range_end:
             gaps.append((cursor, range_end))
         return CoverageSummary(covered, gaps)
+
+    def build_report(
+        self,
+        *,
+        guild_id: int,
+        members: list[ReportMember],
+        start_epoch: int,
+        end_epoch: int,
+        as_of_epoch: int,
+    ) -> ActivityReport:
+        _require_integer_epochs(
+            start_epoch=start_epoch,
+            end_epoch=end_epoch,
+            as_of_epoch=as_of_epoch,
+        )
+        start_date = datetime.fromtimestamp(start_epoch, KST).date()
+        end_date = datetime.fromtimestamp(end_epoch - 1, KST).date()
+        rows: list[ReportRow] = []
+        with closing(self._connect()) as conn:
+            for member in members:
+                sessions = conn.execute(
+                    """
+                    SELECT activity_kind, started_epoch, ended_epoch
+                    FROM voice_sessions
+                    WHERE guild_id=? AND user_id=?
+                    ORDER BY started_epoch, id
+                    """,
+                    (guild_id, member.user_id),
+                ).fetchall()
+                seconds = {"reading_room": 0, "study": 0}
+                counts = {"reading_room": 0, "study": 0}
+                last_activity_epoch: int | None = None
+                for activity_kind, started, ended in sessions:
+                    overlap = session_overlap_seconds(
+                        started,
+                        ended,
+                        start_epoch,
+                        end_epoch,
+                    )
+                    seconds[activity_kind] += overlap
+                    if overlap > 0:
+                        counts[activity_kind] += 1
+                    activity_epoch = as_of_epoch if ended is None else ended
+                    if (
+                        last_activity_epoch is None
+                        or activity_epoch > last_activity_epoch
+                    ):
+                        last_activity_epoch = activity_epoch
+
+                daily = conn.execute(
+                    """
+                    SELECT
+                        COUNT(DISTINCT CASE
+                            WHEN event_type='sod' THEN event_date_kst
+                        END),
+                        COUNT(DISTINCT CASE
+                            WHEN event_type='eod' THEN event_date_kst
+                        END),
+                        COUNT(DISTINCT event_date_kst)
+                    FROM sod_eod_daily
+                    WHERE guild_id=? AND user_id=?
+                      AND event_date_kst BETWEEN ? AND ?
+                    """,
+                    (
+                        guild_id,
+                        member.user_id,
+                        start_date.isoformat(),
+                        end_date.isoformat(),
+                    ),
+                ).fetchone()
+                latest_message = conn.execute(
+                    """
+                    SELECT MAX(message_created_epoch)
+                    FROM sod_eod_events
+                    WHERE guild_id=? AND user_id=?
+                    """,
+                    (guild_id, member.user_id),
+                ).fetchone()[0]
+                if latest_message is not None and (
+                    last_activity_epoch is None
+                    or latest_message > last_activity_epoch
+                ):
+                    last_activity_epoch = latest_message
+
+                rows.append(
+                    ReportRow(
+                        user_id=member.user_id,
+                        display_name=member.display_name,
+                        last_activity_epoch=last_activity_epoch,
+                        reading_seconds=seconds["reading_room"],
+                        study_seconds=seconds["study"],
+                        reading_session_count=counts["reading_room"],
+                        study_session_count=counts["study"],
+                        sod_days=int(daily[0]),
+                        eod_days=int(daily[1]),
+                        combined_days=int(daily[2]),
+                    )
+                )
+
+        rows.sort(
+            key=lambda row: (
+                row.last_activity_epoch is not None,
+                row.last_activity_epoch or 0,
+                row.display_name.casefold(),
+            )
+        )
+        warnings = self._build_report_warnings(
+            guild_id=guild_id,
+            start_epoch=start_epoch,
+            end_epoch=end_epoch,
+        )
+        return ActivityReport(
+            rows=rows,
+            warnings=warnings,
+            start_date=start_date,
+            end_date=end_date,
+            start_epoch=start_epoch,
+            end_epoch=end_epoch,
+            generated_epoch=as_of_epoch,
+            period_label=f"조회 기간: {start_date} ~ {end_date}",
+            txt_filename=(
+                f"activity-report-{start_date:%Y%m%d}-{end_date:%Y%m%d}-kst.txt"
+            ),
+            page_count=max(1, (len(rows) + 14) // 15),
+        )
+
+    def _build_report_warnings(
+        self,
+        *,
+        guild_id: int,
+        start_epoch: int,
+        end_epoch: int,
+    ) -> list[CoverageWarning]:
+        warnings = [
+            CoverageWarning(
+                code="voice_gap",
+                text=(
+                    f"음성 수집 누락 구간: {gap_start}~{gap_end} UTC epoch. "
+                    "이 구간의 값은 부분 데이터입니다."
+                ),
+            )
+            for gap_start, gap_end in self.voice_coverage_for_range(
+                guild_id, start_epoch, end_epoch
+            ).gaps
+        ]
+
+        with closing(self._connect()) as conn:
+            raw_periods = conn.execute(
+                """
+                SELECT channel_id, started_epoch, ended_epoch
+                FROM sod_eod_channel_periods
+                WHERE guild_id=?
+                  AND started_epoch < ?
+                  AND COALESCE(ended_epoch, ?) > ?
+                ORDER BY started_epoch, id
+                """,
+                (guild_id, end_epoch, end_epoch, start_epoch),
+            ).fetchall()
+            periods = [
+                (
+                    channel_id,
+                    max(started, start_epoch),
+                    min(end_epoch if ended is None else ended, end_epoch),
+                )
+                for channel_id, started, ended in raw_periods
+            ]
+            periods = [period for period in periods if period[1] < period[2]]
+
+            for gap_start, gap_end in self._coverage_gaps(
+                [(started, ended) for _, started, ended in periods],
+                start_epoch,
+                end_epoch,
+            ):
+                warnings.append(
+                    CoverageWarning(
+                        code="sod_channel_gap",
+                        text=(
+                            "SoD/EoD 채널 미설정 구간: "
+                            f"{gap_start}~{gap_end} UTC epoch. "
+                            "이 구간의 값은 부분 데이터입니다."
+                        ),
+                    )
+                )
+
+            if not periods:
+                warnings.append(
+                    CoverageWarning(
+                        code="sod_history_unavailable",
+                        text=(
+                            f"조회 구간 {start_epoch}~{end_epoch} UTC epoch에 "
+                            "SoD/EoD 채널 이력 시작점을 확인할 수 없습니다."
+                        ),
+                    )
+                )
+                return warnings
+
+            for channel_id, period_start, period_end in periods:
+                state = conn.execute(
+                    """
+                    SELECT history_from_epoch, completed_epoch
+                    FROM activity_sync_state
+                    WHERE guild_id=? AND channel_id=?
+                    """,
+                    (guild_id, channel_id),
+                ).fetchone()
+                history_from_epoch = None if state is None else state[0]
+                completed_epoch = None if state is None else state[1]
+                if history_from_epoch is None:
+                    warnings.append(
+                        CoverageWarning(
+                            code="sod_history_unavailable",
+                            text=(
+                                f"SoD/EoD 채널 {channel_id}의 접근 가능한 과거 이력 "
+                                "시작점을 확인할 수 없습니다; 활성 구간 "
+                                f"{period_start}~{period_end} UTC epoch의 값은 "
+                                "부분 데이터입니다."
+                            ),
+                        )
+                    )
+                elif history_from_epoch > period_start:
+                    unavailable_end = min(history_from_epoch, period_end)
+                    warnings.append(
+                        CoverageWarning(
+                            code="sod_history_partial",
+                            text=(
+                                f"SoD/EoD 채널 {channel_id}의 접근 가능한 이력은 "
+                                f"{history_from_epoch} UTC epoch부터입니다; 활성 구간 "
+                                f"{period_start}~{unavailable_end} UTC epoch의 값은 "
+                                "부분 데이터입니다."
+                            ),
+                        )
+                    )
+                if completed_epoch is None:
+                    warnings.append(
+                        CoverageWarning(
+                            code="sod_backfill_incomplete",
+                            text=(
+                                f"SoD/EoD 채널 {channel_id}의 과거 동기화가 "
+                                "완료되지 않았습니다; 활성 구간 "
+                                f"{period_start}~{period_end} UTC epoch의 값은 "
+                                "부분 데이터입니다."
+                            ),
+                        )
+                    )
+        return warnings
+
+    @staticmethod
+    def _coverage_gaps(
+        covered_ranges: list[tuple[int, int]],
+        range_start: int,
+        range_end: int,
+    ) -> list[tuple[int, int]]:
+        merged: list[tuple[int, int]] = []
+        for start, end in sorted(covered_ranges):
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        gaps: list[tuple[int, int]] = []
+        cursor = range_start
+        for start, end in merged:
+            if cursor < start:
+                gaps.append((cursor, start))
+            cursor = max(cursor, end)
+        if cursor < range_end:
+            gaps.append((cursor, range_end))
+        return gaps
 
     def list_sessions(
         self, guild_id: int, user_id: int
