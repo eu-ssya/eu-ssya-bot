@@ -1,8 +1,10 @@
+import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
 from datetime import date
 from pathlib import Path
+from unittest import mock
 
 from activity_store import ActivityStore, kst_day_for_epoch, kst_range_to_epoch
 
@@ -198,3 +200,136 @@ class ConfigurationTests(unittest.TestCase):
                 """
             ).fetchone()
         self.assertEqual(period, (40, 100, 120, "config_invalid"))
+
+
+class VoiceSessionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = ActivityStore(str(Path(self.tmp.name) / "activity.db"))
+        self.store.initialize()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_kind_transition_and_clip(self):
+        self.store.reconcile_session(1, 2, "reading_room", 100)
+        self.store.reconcile_session(1, 2, "reading_room", 130)
+        self.store.reconcile_session(1, 2, "study", 160)
+        self.store.reconcile_session(1, 2, None, 220, close_reason="normal")
+
+        self.assertEqual(
+            self.store.list_sessions(1, 2),
+            [
+                ("reading_room", 100, 160, "category_change"),
+                ("study", 160, 220, "normal"),
+            ],
+        )
+        self.assertEqual(
+            self.store.voice_seconds_for_range(1, 2, "study", 170, 200), 30
+        )
+
+    def test_disconnect_creates_exact_gap(self):
+        self.store.open_collection_run(1, 100)
+        self.store.close_open_rows(1, 160, "gateway_disconnect")
+        self.store.open_collection_run(1, 200)
+
+        self.assertEqual(
+            self.store.voice_coverage_for_range(1, 100, 240).gaps,
+            [(160, 200)],
+        )
+
+    def test_open_session_unique_race_rechecks_after_injected_duplicate(self):
+        with closing(self.store._connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO voice_sessions(
+                    guild_id, user_id, activity_kind, started_epoch,
+                    last_checkpoint_epoch
+                ) VALUES (1, 2, 'study', 90, 90)
+                """
+            )
+            conn.commit()
+        original_get = self.store._get_open_session_in_tx
+        unique = sqlite3.IntegrityError("UNIQUE constraint failed")
+        unique.sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT_UNIQUE
+        unique.sqlite_errorname = "SQLITE_CONSTRAINT_UNIQUE"
+        calls = iter([None])
+
+        def stale_then_actual(conn, guild_id, user_id):
+            try:
+                return next(calls)
+            except StopIteration:
+                return original_get(conn, guild_id, user_id)
+
+        with mock.patch.object(
+            self.store, "_get_open_session_in_tx", side_effect=stale_then_actual
+        ), mock.patch.object(
+            self.store, "_insert_open_session_in_tx", side_effect=unique
+        ):
+            self.store.reconcile_session(1, 2, "study", 100)
+
+        self.assertEqual(self.store.open_session_count(1, 2), 1)
+
+    def test_unique_race_different_kind_transitions_and_check_error_reraises(self):
+        with closing(self.store._connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO voice_sessions(
+                    guild_id, user_id, activity_kind, started_epoch,
+                    last_checkpoint_epoch
+                ) VALUES (1, 2, 'study', 90, 90)
+                """
+            )
+            conn.commit()
+        original_get = self.store._get_open_session_in_tx
+        original_insert = self.store._insert_open_session_in_tx
+        unique = sqlite3.IntegrityError("UNIQUE constraint failed")
+        unique.sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT_UNIQUE
+        unique.sqlite_errorname = "SQLITE_CONSTRAINT_UNIQUE"
+        reads = iter([None])
+        inserts = iter([unique, None])
+
+        def stale_then_actual(conn, guild_id, user_id):
+            try:
+                return next(reads)
+            except StopIteration:
+                return original_get(conn, guild_id, user_id)
+
+        def unique_then_real(*args):
+            outcome = next(inserts)
+            if outcome is not None:
+                raise outcome
+            return original_insert(*args)
+
+        with mock.patch.object(
+            self.store, "_get_open_session_in_tx", side_effect=stale_then_actual
+        ), mock.patch.object(
+            self.store,
+            "_insert_open_session_in_tx",
+            side_effect=unique_then_real,
+        ):
+            self.store.reconcile_session(1, 2, "reading_room", 100)
+
+        self.assertEqual(
+            self.store.list_sessions(1, 2),
+            [
+                ("study", 90, 100, "category_change"),
+                ("reading_room", 100, None, None),
+            ],
+        )
+        bad = sqlite3.IntegrityError("CHECK constraint failed")
+        bad.sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT_CHECK
+        with mock.patch.object(
+            self.store, "_insert_open_session_in_tx", side_effect=bad
+        ):
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.store.reconcile_session(1, 3, "study", 100)
+
+    def test_graceful_shutdown_uses_session_and_run_reason_sets(self):
+        self.store.reconcile_session(1, 2, "study", 100)
+        self.store.open_collection_run(1, 100)
+
+        self.store.close_open_rows(1, 120, "graceful_shutdown")
+
+        self.assertEqual(self.store.list_sessions(1, 2)[0][3], "reconciled")
+        self.assertEqual(self.store.list_runs(1)[0][3], "graceful_shutdown")

@@ -154,6 +154,257 @@ class ActivityStore:
             )
             return [tuple(row) for row in rows]
 
+    def reconcile_session(
+        self,
+        guild_id: int,
+        user_id: int,
+        desired_kind: str | None,
+        effective_at_epoch: int,
+        close_reason: str = "reconciled",
+    ) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._get_open_session_in_tx(conn, guild_id, user_id)
+                if row and (desired_kind is None or row[1] != desired_kind):
+                    reason = "category_change" if desired_kind else close_reason
+                    conn.execute(
+                        """
+                        UPDATE voice_sessions
+                        SET ended_epoch=?, closed_reason=?
+                        WHERE id=?
+                        """,
+                        (effective_at_epoch, reason, row[0]),
+                    )
+                if desired_kind and (row is None or row[1] != desired_kind):
+                    try:
+                        self._insert_open_session_in_tx(
+                            conn,
+                            guild_id,
+                            user_id,
+                            desired_kind,
+                            effective_at_epoch,
+                        )
+                    except sqlite3.IntegrityError as exc:
+                        if exc.sqlite_errorcode != sqlite3.SQLITE_CONSTRAINT_UNIQUE:
+                            raise
+                        retry = self._get_open_session_in_tx(
+                            conn, guild_id, user_id
+                        )
+                        if retry is None:
+                            raise
+                        if retry[1] == desired_kind:
+                            conn.commit()
+                            return
+                        conn.execute(
+                            """
+                            UPDATE voice_sessions
+                            SET ended_epoch=?, closed_reason='category_change'
+                            WHERE id=?
+                            """,
+                            (effective_at_epoch, retry[0]),
+                        )
+                        self._insert_open_session_in_tx(
+                            conn,
+                            guild_id,
+                            user_id,
+                            desired_kind,
+                            effective_at_epoch,
+                        )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def open_collection_run(self, guild_id: int, started_epoch: int) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    """
+                    SELECT id
+                    FROM voice_collection_runs
+                    WHERE guild_id=? AND ended_epoch IS NULL
+                    """,
+                    (guild_id,),
+                ).fetchone()
+                if row is None:
+                    conn.execute(
+                        """
+                        INSERT INTO voice_collection_runs(
+                            guild_id, started_epoch, last_checkpoint_epoch
+                        ) VALUES (?, ?, ?)
+                        """,
+                        (guild_id, started_epoch, started_epoch),
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def close_open_rows(
+        self, guild_id: int, effective_at_epoch: int, reason: str
+    ) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._close_open_rows_in_tx(
+                    conn, guild_id, effective_at_epoch, reason
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def checkpoint_open_rows(self, guild_id: int, checkpoint_epoch: int) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    """
+                    UPDATE voice_sessions
+                    SET last_checkpoint_epoch=?
+                    WHERE guild_id=? AND ended_epoch IS NULL
+                    """,
+                    (checkpoint_epoch, guild_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE voice_collection_runs
+                    SET last_checkpoint_epoch=?
+                    WHERE guild_id=? AND ended_epoch IS NULL
+                    """,
+                    (checkpoint_epoch, guild_id),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def voice_seconds_for_range(
+        self,
+        guild_id: int,
+        user_id: int,
+        activity_kind: str,
+        range_start: int,
+        range_end: int,
+    ) -> int:
+        if range_end <= range_start:
+            return 0
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT COALESCE(SUM(
+                    MAX(
+                        0,
+                        MIN(COALESCE(ended_epoch, ?), ?) - MAX(started_epoch, ?)
+                    )
+                ), 0)
+                FROM voice_sessions
+                WHERE guild_id=?
+                  AND user_id=?
+                  AND activity_kind=?
+                  AND started_epoch < ?
+                  AND COALESCE(ended_epoch, ?) > ?
+                """,
+                (
+                    range_end,
+                    range_end,
+                    range_start,
+                    guild_id,
+                    user_id,
+                    activity_kind,
+                    range_end,
+                    range_end,
+                    range_start,
+                ),
+            ).fetchone()
+        return int(row[0])
+
+    def voice_coverage_for_range(
+        self, guild_id: int, range_start: int, range_end: int
+    ) -> CoverageSummary:
+        if range_end <= range_start:
+            return CoverageSummary([], [])
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT started_epoch, ended_epoch
+                FROM voice_collection_runs
+                WHERE guild_id=?
+                  AND started_epoch < ?
+                  AND COALESCE(ended_epoch, ?) > ?
+                ORDER BY started_epoch, id
+                """,
+                (guild_id, range_end, range_end, range_start),
+            ).fetchall()
+
+        covered: list[tuple[int, int]] = []
+        for started_epoch, ended_epoch in rows:
+            start = max(started_epoch, range_start)
+            end = min(
+                range_end if ended_epoch is None else ended_epoch,
+                range_end,
+            )
+            if start >= end:
+                continue
+            if covered and start <= covered[-1][1]:
+                covered[-1] = (covered[-1][0], max(covered[-1][1], end))
+            else:
+                covered.append((start, end))
+
+        gaps: list[tuple[int, int]] = []
+        cursor = range_start
+        for start, end in covered:
+            if cursor < start:
+                gaps.append((cursor, start))
+            cursor = max(cursor, end)
+        if cursor < range_end:
+            gaps.append((cursor, range_end))
+        return CoverageSummary(covered, gaps)
+
+    def list_sessions(
+        self, guild_id: int, user_id: int
+    ) -> list[tuple[str, int, int | None, str | None]]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT activity_kind, started_epoch, ended_epoch, closed_reason
+                FROM voice_sessions
+                WHERE guild_id=? AND user_id=?
+                ORDER BY started_epoch, id
+                """,
+                (guild_id, user_id),
+            )
+            return [tuple(row) for row in rows]
+
+    def list_runs(
+        self, guild_id: int
+    ) -> list[tuple[int, int, int | None, str | None]]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT started_epoch, last_checkpoint_epoch, ended_epoch, ended_reason
+                FROM voice_collection_runs
+                WHERE guild_id=?
+                ORDER BY started_epoch, id
+                """,
+                (guild_id,),
+            )
+            return [tuple(row) for row in rows]
+
+    def open_session_count(self, guild_id: int, user_id: int) -> int:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM voice_sessions
+                WHERE guild_id=? AND user_id=? AND ended_epoch IS NULL
+                """,
+                (guild_id, user_id),
+            ).fetchone()
+        return int(row[0])
+
     def invalidate_sod_eod_channel(
         self, guild_id: int, *, effective_at_epoch: int
     ) -> ActivityConfig:
@@ -237,13 +488,14 @@ class ActivityStore:
     def _close_open_rows_in_tx(
         conn: sqlite3.Connection, guild_id: int, effective_at_epoch: int, reason: str
     ) -> None:
+        session_reason = "reconciled" if reason == "graceful_shutdown" else reason
         conn.execute(
             """
             UPDATE voice_sessions
             SET ended_epoch=?, closed_reason=?
             WHERE guild_id=? AND ended_epoch IS NULL
             """,
-            (effective_at_epoch, reason, guild_id),
+            (effective_at_epoch, session_reason, guild_id),
         )
         conn.execute(
             """
@@ -252,6 +504,37 @@ class ActivityStore:
             WHERE guild_id=? AND ended_epoch IS NULL
             """,
             (effective_at_epoch, reason, guild_id),
+        )
+
+    @staticmethod
+    def _get_open_session_in_tx(
+        conn: sqlite3.Connection, guild_id: int, user_id: int
+    ) -> tuple[int, str] | None:
+        return conn.execute(
+            """
+            SELECT id, activity_kind
+            FROM voice_sessions
+            WHERE guild_id=? AND user_id=? AND ended_epoch IS NULL
+            """,
+            (guild_id, user_id),
+        ).fetchone()
+
+    @staticmethod
+    def _insert_open_session_in_tx(
+        conn: sqlite3.Connection,
+        guild_id: int,
+        user_id: int,
+        activity_kind: str,
+        started_epoch: int,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO voice_sessions(
+                guild_id, user_id, activity_kind, started_epoch,
+                last_checkpoint_epoch
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (guild_id, user_id, activity_kind, started_epoch, started_epoch),
         )
 
     @staticmethod
