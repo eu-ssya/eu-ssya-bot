@@ -96,10 +96,21 @@ def _is_zero_width_extension(character: str) -> bool:
     )
 
 
+def _is_regional_indicator(character: str) -> bool:
+    return 0x1F1E6 <= ord(character) <= 0x1F1FF
+
+
 def _terminal_clusters(value: str) -> list[str]:
     clusters: list[str] = []
     for character in value:
         if (
+            _is_regional_indicator(character)
+            and clusters
+            and len(clusters[-1]) == 1
+            and _is_regional_indicator(clusters[-1])
+        ):
+            clusters[-1] += character
+        elif (
             not clusters
             or (
                 not _is_zero_width_extension(character)

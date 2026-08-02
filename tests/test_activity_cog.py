@@ -3635,6 +3635,12 @@ class ActivityReportFormattingTests(unittest.TestCase):
         self.assertEqual(_fit_terminal_cell("한글", 6), "한글  ")
         self.assertEqual(_fit_terminal_cell("12", 4, align="right"), "  12")
 
+    def test_terminal_cell_width_treats_regional_indicator_pair_as_emoji(self):
+        from activity_cog import _fit_terminal_cell, _terminal_cell_width
+
+        self.assertEqual(_terminal_cell_width("🇰🇷"), 2)
+        self.assertEqual(_terminal_cell_width(_fit_terminal_cell("🇰🇷", 14)), 14)
+
     def test_recent_activity_and_duration_are_human_readable(self):
         from activity_cog import _format_duration, _format_recent_activity
 
