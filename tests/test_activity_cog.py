@@ -3901,18 +3901,22 @@ class ActivityReportViewTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(_terminal_cell_width(name_cell), 14)
             self.assertIn("...", name_cell)
 
-    def test_page_and_txt_share_warning_text(self):
+    def test_page_and_txt_share_humanized_warning_text(self):
         from activity_cog import build_report_txt, format_report_page
 
         warning = CoverageWarning(
             code="gateway_disconnect",
-            text="음성 수집 공백: 160~200",
+            text="음성 수집 공백: 1785607200~1785610800 UTC epoch",
         )
         report = make_report([self.row()], warnings=[warning])
         page = format_report_page(report, 0)
         text = build_report_txt(report)
-        self.assertIn(warning.text, page)
-        self.assertIn(warning.text, text)
+        self.assertIn("KST", page)
+        self.assertIn("KST", text)
+        self.assertNotIn("1785607200", page)
+        self.assertNotIn("1785607200", text)
+        self.assertNotIn("UTC epoch", page)
+        self.assertNotIn("UTC epoch", text)
 
     async def test_owner_admin_and_same_guild_are_rechecked_before_any_mutation(self):
         report = report_with_members(16)
@@ -4005,10 +4009,18 @@ class ActivityReportViewTests(unittest.IsolatedAsyncioTestCase):
         logged.assert_called_once()
         view.original_response_editor.assert_awaited_once_with(view=view)
 
-    async def test_txt_defers_then_sends_one_use_bytesio_file_with_all_fields(self):
-        from activity_cog import build_report_txt
+    async def test_txt_uses_same_table_without_ids_seconds_or_session_counts(self):
+        from activity_cog import build_report_txt, format_report_page
 
-        report = make_report([self.row(display_name="보고 대상")])
+        recent_epoch = int(
+            datetime.datetime(2026, 8, 3, 23, 24, tzinfo=KST).timestamp()
+        )
+        row = self.row(
+            index=987654321012345678,
+            display_name="보고 대상",
+            last_activity_epoch=recent_epoch,
+        )
+        report = make_report([row])
         view, _original = self.make_view(report)
         interaction = fake_interaction(1, True, FakeGuild(1))
 
@@ -4025,23 +4037,62 @@ class ActivityReportViewTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(attachment.fp, __import__("io").BytesIO)
         payload = attachment.fp.getvalue().decode("utf-8")
         self.assertEqual(payload, build_report_txt(report))
-        for expected in (
-            "보고 대상",
-            "user_id=1",
-            "last_activity_utc=",
-            "last_activity_kst=",
-            "reading_seconds=61",
-            "reading_session_count=2",
-            "study_seconds=122",
-            "study_session_count=3",
-            "sod_days=4",
-            "eod_days=5",
-            "combined_days=6",
-            report.period_label,
-            "생성 UTC:",
-            "생성 KST:",
+        page_table = format_report_page(report, 0).split("```text\n", 1)[1].split(
+            "\n```", 1
+        )[0]
+        self.assertIn(page_table, payload)
+        self.assertIn("2026-08-03 23:24", payload)
+        self.assertIn("1분", payload)
+        for forbidden in (
+            str(row.user_id),
+            "user_id=",
+            "reading_seconds=",
+            "study_seconds=",
+            "reading_session_count=",
+            "study_session_count=",
+            "독서회",
+            "스터디회",
         ):
-            self.assertIn(expected, payload)
+            self.assertNotIn(forbidden, payload)
+
+    def test_txt_contains_all_rows_and_full_humanized_warnings(self):
+        from activity_cog import build_report_txt
+
+        gap_start = int(
+            datetime.datetime(2026, 8, 1, 3, 0, tzinfo=KST).timestamp()
+        )
+        gap_end = int(
+            datetime.datetime(2026, 8, 1, 5, 10, tzinfo=KST).timestamp()
+        )
+        report = make_report(
+            [
+                self.row(index, display_name=f"Member {index:02d}")
+                for index in range(1, 56)
+            ],
+            warnings=[
+                CoverageWarning(
+                    code="voice_gap",
+                    text=(
+                        f"음성 수집 누락 구간: {gap_start}~{gap_end} UTC epoch. "
+                        "이 구간의 값은 부분 데이터입니다."
+                    ),
+                )
+            ],
+        )
+
+        payload = build_report_txt(report)
+        table_lines = [
+            line for line in payload.splitlines() if line[:4].strip().isdigit()
+        ]
+
+        self.assertEqual(len(table_lines), 55)
+        self.assertTrue(table_lines[0].startswith("   1 "))
+        self.assertTrue(table_lines[-1].startswith("  55 "))
+        self.assertIn(
+            "음성 수집 공백: 2026-08-01 03:00 KST ~ 2026-08-01 05:10 KST",
+            payload,
+        )
+        self.assertNotIn("UTC epoch", payload)
 
 
 class ActivityReportCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -4067,12 +4118,20 @@ class ActivityReportCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_non_admin_is_rejected_before_defer_and_store(self):
         cog, guild, _member = self.make_fixture()
-        interaction = fake_interaction(2, False, guild)
-        with mock.patch.object(cog, "_store_call", new=mock.AsyncMock()) as store_call:
-            await cog.recent_report.callback(cog, interaction, 1)
-        store_call.assert_not_awaited()
-        self.assertFalse(interaction.response.deferred)
-        self.assertTrue(interaction.response.sent[0][1]["ephemeral"])
+        cases = (
+            (cog.recent_report, (1,)),
+            (cog.period_report, ("2026-08-01", "2026-08-03")),
+        )
+        for command, arguments in cases:
+            with self.subTest(command=command.name):
+                interaction = fake_interaction(2, False, guild)
+                with mock.patch.object(
+                    cog, "_store_call", new=mock.AsyncMock()
+                ) as store_call:
+                    await command.callback(cog, interaction, *arguments)
+                store_call.assert_not_awaited()
+                self.assertFalse(interaction.response.deferred)
+                self.assertTrue(interaction.response.sent[0][1]["ephemeral"])
 
     async def test_recent_uses_inclusive_kst_today_and_captures_generation_once(self):
         cog, guild, _member = self.make_fixture()

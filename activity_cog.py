@@ -348,46 +348,26 @@ def format_report_page(report: ActivityReport, page_index: int) -> str:
 
 
 def build_report_txt(report: ActivityReport) -> str:
-    generated_utc = _format_timestamp(report.generated_epoch, timezone.utc)
-    generated_kst = _format_timestamp(report.generated_epoch, KST)
+    generated = _format_recent_activity(report.generated_epoch)
     lines = [
         "활동 현황 보고서",
         report.period_label,
-        f"기간 epoch: [{report.start_epoch}, {report.end_epoch})",
-        f"생성 UTC: {generated_utc}",
-        f"생성 KST: {generated_kst}",
+        f"생성: {generated} KST",
+        "정렬: 활동일 ↓ · 음성시간 ↓ · 최근활동 ↓",
         "",
-        *_txt_warning_summary_lines(report),
+        *_report_table_lines(report.rows, start_rank=1),
     ]
-    if report.warnings:
-        lines.extend(
-            ["", "전체 coverage 경고:"]
-            + [f"- [{warning.code}] {warning.text}" for warning in report.warnings]
-        )
-    lines.extend(["", "현재 대상 멤버:"])
     if not report.rows:
         lines.append("표시할 대상 멤버가 없습니다.")
-    for row in report.rows:
-        name = " ".join(str(row.display_name).split()) or "이름 없음"
-        lines.append(
-            " | ".join(
-                (
-                    f"name={name}",
-                    f"user_id={row.user_id}",
-                    "last_activity_utc="
-                    + _format_timestamp(row.last_activity_epoch, timezone.utc),
-                    "last_activity_kst="
-                    + _format_timestamp(row.last_activity_epoch, KST),
-                    f"reading_seconds={row.reading_seconds}",
-                    f"reading_session_count={row.reading_session_count}",
-                    f"study_seconds={row.study_seconds}",
-                    f"study_session_count={row.study_session_count}",
-                    f"sod_days={row.sod_days}",
-                    f"eod_days={row.eod_days}",
-                    f"combined_days={row.combined_days}",
-                )
-            )
+
+    lines.extend(["", "전체 coverage 경고:"])
+    if report.warnings:
+        lines.extend(
+            f"- [{warning.code}] {_humanize_warning(warning)}"
+            for warning in report.warnings
         )
+    else:
+        lines.append("- 없음")
     return "\n".join(lines) + "\n"
 
 
