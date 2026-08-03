@@ -3689,7 +3689,7 @@ class ActivityReportFormattingTests(unittest.TestCase):
 
         single = _humanize_warning(
             CoverageWarning(
-                code="sod_history_partial",
+                code="gateway_disconnect",
                 text=f"접근 가능한 이력은 {gap_start} UTC epoch부터입니다.",
             )
         )
@@ -3697,6 +3697,46 @@ class ActivityReportFormattingTests(unittest.TestCase):
             single,
             "접근 가능한 이력은 2026-08-01 03:00 KST부터입니다.",
         )
+
+    def test_sod_history_warnings_hide_channel_ids_in_page_and_txt(self):
+        from activity_cog import build_report_txt, format_report_page
+
+        channel_id = 987654321012345678
+        cases = (
+            (
+                "sod_history_unavailable",
+                (
+                    f"SoD/EoD 채널 {channel_id}의 접근 가능한 과거 이력 시작점을 "
+                    "확인할 수 없습니다; 활성 구간 1785607200~1785610800 UTC "
+                    "epoch의 값은 부분 데이터입니다."
+                ),
+                "SoD/EoD 이력 시작점을 확인할 수 없어 이 조회의 값은 "
+                "부분 데이터입니다.",
+            ),
+            (
+                "sod_history_partial",
+                (
+                    f"SoD/EoD 채널 {channel_id}의 접근 가능한 이력은 "
+                    "1785607200 UTC epoch부터입니다; 활성 구간 "
+                    "1785603600~1785607200 UTC epoch의 값은 부분 데이터입니다."
+                ),
+                "SoD/EoD 이력 일부에 접근할 수 없어 이 조회의 값은 "
+                "부분 데이터입니다.",
+            ),
+        )
+
+        for code, source_text, expected in cases:
+            with self.subTest(code=code):
+                report = make_report(
+                    [], warnings=[CoverageWarning(code=code, text=source_text)]
+                )
+                for rendered in (
+                    format_report_page(report, 0),
+                    build_report_txt(report),
+                ):
+                    self.assertIn(expected, rendered)
+                    self.assertNotIn(str(channel_id), rendered)
+                    self.assertNotIn("UTC epoch", rendered)
 
 
 class ActivityReportViewTests(unittest.IsolatedAsyncioTestCase):

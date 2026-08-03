@@ -203,6 +203,11 @@ def _format_duration(seconds: int) -> str:
 
 
 def _humanize_warning(warning: CoverageWarning) -> str:
+    if warning.code == "sod_history_unavailable":
+        return "SoD/EoD 이력 시작점을 확인할 수 없어 이 조회의 값은 부분 데이터입니다."
+    if warning.code == "sod_history_partial":
+        return "SoD/EoD 이력 일부에 접근할 수 없어 이 조회의 값은 부분 데이터입니다."
+
     text = " ".join(str(warning.text).split())
     text = _WARNING_EPOCH_RANGE.sub(
         lambda match: (
