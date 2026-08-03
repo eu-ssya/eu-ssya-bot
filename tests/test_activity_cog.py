@@ -3641,6 +3641,14 @@ class ActivityReportFormattingTests(unittest.TestCase):
         self.assertEqual(_terminal_cell_width("🇰🇷"), 2)
         self.assertEqual(_terminal_cell_width(_fit_terminal_cell("🇰🇷", 14)), 14)
 
+    def test_terminal_cell_width_treats_vs16_text_symbols_as_emoji(self):
+        from activity_cog import _fit_terminal_cell, _terminal_cell_width
+
+        for value in ("©️", "↔️"):
+            with self.subTest(value=value):
+                self.assertEqual(_terminal_cell_width(value), 2)
+                self.assertEqual(_terminal_cell_width(_fit_terminal_cell(value, 14)), 14)
+
     def test_recent_activity_and_duration_are_human_readable(self):
         from activity_cog import _format_duration, _format_recent_activity
 
@@ -3710,8 +3718,8 @@ class ActivityReportFormattingTests(unittest.TestCase):
                     "확인할 수 없습니다; 활성 구간 1785607200~1785610800 UTC "
                     "epoch의 값은 부분 데이터입니다."
                 ),
-                "SoD/EoD 이력 시작점을 확인할 수 없어 이 조회의 값은 "
-                "부분 데이터입니다.",
+                "SoD/EoD 채널의 접근 가능한 과거 이력 시작점을 "
+                "확인할 수 없습니다",
             ),
             (
                 "sod_history_partial",
@@ -3720,8 +3728,7 @@ class ActivityReportFormattingTests(unittest.TestCase):
                     "1785607200 UTC epoch부터입니다; 활성 구간 "
                     "1785603600~1785607200 UTC epoch의 값은 부분 데이터입니다."
                 ),
-                "SoD/EoD 이력 일부에 접근할 수 없어 이 조회의 값은 "
-                "부분 데이터입니다.",
+                "SoD/EoD 채널의 접근 가능한 이력은",
             ),
         )
 
@@ -3736,6 +3743,64 @@ class ActivityReportFormattingTests(unittest.TestCase):
                 ):
                     self.assertIn(expected, rendered)
                     self.assertNotIn(str(channel_id), rendered)
+                    self.assertNotIn("UTC epoch", rendered)
+
+    def test_all_sod_channel_warnings_keep_kst_context_without_ids_or_epochs(self):
+        from activity_cog import build_report_txt, format_report_page
+
+        channel_id = 987654321012345678
+        gap_start = int(
+            datetime.datetime(2026, 8, 1, 3, 0, tzinfo=KST).timestamp()
+        )
+        gap_end = int(
+            datetime.datetime(2026, 8, 1, 5, 10, tzinfo=KST).timestamp()
+        )
+        cases = (
+            (
+                "sod_history_unavailable",
+                (
+                    f"SoD/EoD 채널 {channel_id}의 접근 가능한 과거 이력 시작점을 "
+                    f"확인할 수 없습니다; 활성 구간 {gap_start}~{gap_end} UTC "
+                    "epoch의 값은 부분 데이터입니다."
+                ),
+                ("이력 시작점", "활성 구간", "부분 데이터"),
+            ),
+            (
+                "sod_history_partial",
+                (
+                    f"SoD/EoD 채널 {channel_id}의 접근 가능한 이력은 "
+                    f"{gap_end} UTC epoch부터입니다; 활성 구간 "
+                    f"{gap_start}~{gap_end} UTC epoch의 값은 부분 데이터입니다."
+                ),
+                ("접근 가능한 이력", "활성 구간", "부분 데이터"),
+            ),
+            (
+                "sod_backfill_incomplete",
+                (
+                    f"SoD/EoD 채널 {channel_id}의 과거 동기화가 완료되지 "
+                    f"않았습니다; 활성 구간 {gap_start}~{gap_end} UTC "
+                    "epoch의 값은 부분 데이터입니다."
+                ),
+                ("과거 동기화", "활성 구간", "부분 데이터"),
+            ),
+        )
+
+        for code, source_text, meaning_tokens in cases:
+            with self.subTest(code=code):
+                report = make_report(
+                    [], warnings=[CoverageWarning(code=code, text=source_text)]
+                )
+                for rendered in (
+                    format_report_page(report, 0),
+                    build_report_txt(report),
+                ):
+                    for token in meaning_tokens:
+                        self.assertIn(token, rendered)
+                    self.assertIn("2026-08-01 03:00 KST", rendered)
+                    self.assertIn("2026-08-01 05:10 KST", rendered)
+                    self.assertNotIn(str(channel_id), rendered)
+                    self.assertNotIn(str(gap_start), rendered)
+                    self.assertNotIn(str(gap_end), rendered)
                     self.assertNotIn("UTC epoch", rendered)
 
 
@@ -3904,6 +3969,58 @@ class ActivityReportViewTests(unittest.IsolatedAsyncioTestCase):
             ],
             [3, 5, 20, 50, 67, 73, 77, 84],
         )
+
+    def test_display_name_backticks_cannot_close_page_table_fence(self):
+        from activity_cog import build_report_txt, format_report_page
+
+        report = make_report([self.row(display_name="QA```Lead")])
+
+        page = format_report_page(report, 0)
+        text = build_report_txt(report)
+
+        self.assertEqual(page.count("```"), 2)
+        self.assertIn("QAˋˋˋLead", page)
+        self.assertIn("QAˋˋˋLead", text)
+        self.assertNotIn("```", text)
+
+    def test_large_rank_and_day_counts_are_exact_and_keep_table_alignment(self):
+        from activity_cog import _terminal_cell_width, build_report_txt, format_report_page
+
+        report = report_with_members(10000)
+        report.rows[-1] = ReportRow(
+            user_id=10000,
+            display_name="Boundary",
+            last_activity_epoch=100,
+            reading_seconds=61,
+            study_seconds=122,
+            reading_session_count=2,
+            study_session_count=3,
+            sod_days=1000,
+            eod_days=1001,
+            combined_days=1002,
+        )
+
+        page = format_report_page(report, report.page_count - 1)
+        text = build_report_txt(report)
+        page_table = page.split("```text\n", 1)[1].split("\n```", 1)[0]
+        page_lines = page_table.splitlines()
+        text_lines = text.splitlines()[5 : 5 + len(report.rows) + 1]
+        page_rows = [line for line in page_lines if line.startswith("10000 ")]
+        text_rows = [line for line in text_lines if line.startswith("10000 ")]
+        self.assertEqual(len(page_rows), 1)
+        self.assertEqual(len(text_rows), 1)
+        page_row = page_rows[0]
+        text_row = text_rows[0]
+
+        for rendered_row in (page_row, text_row):
+            self.assertTrue(rendered_row.startswith("10000 Boundary"))
+            self.assertTrue(rendered_row.endswith("1000 1001   1002"))
+            self.assertNotIn("...", rendered_row)
+        self.assertEqual(
+            {_terminal_cell_width(line) for line in page_lines},
+            {_terminal_cell_width(page_lines[0])},
+        )
+        self.assertEqual(_terminal_cell_width(text_lines[0]), _terminal_cell_width(text_row))
 
     def test_fifteen_long_unicode_rows_keep_table_and_shorten_warnings_under_2000(self):
         from activity_cog import _terminal_cell_width, format_report_page

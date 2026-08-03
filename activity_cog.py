@@ -128,6 +128,10 @@ def _terminal_clusters(value: str) -> list[str]:
 
 
 def _cluster_cell_width(cluster: str) -> int:
+    if "\ufe0f" in cluster and any(
+        not _is_zero_width_extension(character) for character in cluster
+    ):
+        return 2
     for character in cluster:
         if _is_zero_width_extension(character):
             continue
@@ -179,6 +183,7 @@ def _fit_terminal_cell(
 
 _WARNING_EPOCH_RANGE = re.compile(r"(?P<start>\d+)~(?P<end>\d+) UTC epoch")
 _WARNING_EPOCH_POINT = re.compile(r"(?P<epoch>\d+) UTC epoch")
+_SOD_CHANNEL_ID = re.compile(r"(SoD/EoD 채널)\s+\d+(?=의)")
 
 
 def _format_kst_minute(epoch: int) -> str:
@@ -203,12 +208,8 @@ def _format_duration(seconds: int) -> str:
 
 
 def _humanize_warning(warning: CoverageWarning) -> str:
-    if warning.code == "sod_history_unavailable":
-        return "SoD/EoD 이력 시작점을 확인할 수 없어 이 조회의 값은 부분 데이터입니다."
-    if warning.code == "sod_history_partial":
-        return "SoD/EoD 이력 일부에 접근할 수 없어 이 조회의 값은 부분 데이터입니다."
-
     text = " ".join(str(warning.text).split())
+    text = _SOD_CHANNEL_ID.sub(r"\1", text)
     text = _WARNING_EPOCH_RANGE.sub(
         lambda match: (
             f"{_format_kst_minute(int(match.group('start')))} ~ "
@@ -289,10 +290,13 @@ def _txt_warning_summary_lines(report: ActivityReport) -> list[str]:
     return lines
 
 
-def _table_line(values: tuple[str, ...]) -> str:
+def _table_line(
+    values: tuple[str, ...],
+    columns=_TABLE_COLUMNS,
+) -> str:
     return " ".join(
         _fit_terminal_cell(value, width, align=align)
-        for value, (_label, width, align) in zip(values, _TABLE_COLUMNS)
+        for value, (_label, width, align) in zip(values, columns)
     )
 
 
@@ -301,23 +305,46 @@ def _report_table_lines(
     *,
     start_rank: int,
 ) -> list[str]:
-    lines = [_table_line(tuple(label for label, _width, _align in _TABLE_COLUMNS))]
+    rendered_rows: list[tuple[str, ...]] = []
     for offset, row in enumerate(rows):
-        name = " ".join(str(row.display_name).split()) or "이름 없음"
-        lines.append(
-            _table_line(
-                (
-                    str(start_rank + offset),
-                    name,
-                    _format_recent_activity(row.last_activity_epoch),
-                    _format_duration(row.reading_seconds),
-                    _format_duration(row.study_seconds),
-                    str(row.sod_days),
-                    str(row.eod_days),
-                    str(row.combined_days),
-                )
+        name = " ".join(str(row.display_name).split()).replace("`", "ˋ") or "이름 없음"
+        rendered_rows.append(
+            (
+                str(start_rank + offset),
+                name,
+                _format_recent_activity(row.last_activity_epoch),
+                _format_duration(row.reading_seconds),
+                _format_duration(row.study_seconds),
+                str(row.sod_days),
+                str(row.eod_days),
+                str(row.combined_days),
             )
         )
+    columns = tuple(
+        (
+            label,
+            width
+            if index == 1
+            else max(
+                (
+                    width,
+                    *(
+                    _terminal_cell_width(values[index])
+                    for values in rendered_rows
+                    ),
+                )
+            ),
+            align,
+        )
+        for index, (label, width, align) in enumerate(_TABLE_COLUMNS)
+    )
+    lines = [
+        _table_line(
+            tuple(label for label, _width, _align in columns),
+            columns,
+        )
+    ]
+    lines.extend(_table_line(values, columns) for values in rendered_rows)
     return lines
 
 
@@ -344,7 +371,7 @@ def format_report_page(report: ActivityReport, page_index: int) -> str:
     warning_budget = REPORT_CONTENT_LIMIT - len(fixed_content) - 1
     warning_lines = _warning_summary_lines(
         report,
-        character_limit=min(REPORT_WARNING_SUMMARY_LIMIT, warning_budget),
+        character_limit=warning_budget,
     )
     content = "\n".join([*fixed_lines, *warning_lines])
     if len(content) > REPORT_CONTENT_LIMIT:
